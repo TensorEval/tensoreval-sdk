@@ -1,13 +1,29 @@
 """Datasets loader for TensorEval.
 
-Supports loading from JSONL files, HuggingFace datasets, or Verifiers environments.
+Supports loading from JSONL files, Python dicts, or HuggingFace datasets.
 """
 
 import json
 from pathlib import Path
 from typing import Any
 
-from tensoreval.core.sample import Sample
+
+class Sample:
+    """A single evaluation sample."""
+
+    def __init__(
+        self,
+        input: str,
+        target: str = "",
+        id: str | int | None = None,
+        rubrics: list[dict] | None = None,
+        metadata: dict | None = None,
+    ):
+        self.input = input
+        self.target = target
+        self.id = id
+        self.rubrics = rubrics or []
+        self.metadata = metadata or {}
 
 
 class Datasets:
@@ -15,13 +31,15 @@ class Datasets:
 
     Usage:
         # From JSONL file
-        datasets = Datasets.load_from_file("tasks.jsonl")
+        ds = Datasets.load_from_file("tasks.jsonl")
 
-        # From HuggingFace dataset
-        datasets = Datasets.from_huggingface("openai/gsm8k", split="test", n=100)
+        # From Python dicts
+        ds = Datasets.load_from_dict([
+            {"query": "What is 2+2?", "reference_answer": "4"},
+        ])
 
-        # From list of dicts
-        datasets = Datasets.from_dicts([{"query": "...", "rubrics": [...], "reference_answer": "..."}])
+        # From HuggingFace
+        ds = Datasets.from_huggingface("gsm8k", split="test", n=10)
     """
 
     def __init__(self, samples: list[Sample], name: str = ""):
@@ -39,15 +57,7 @@ class Datasets:
 
     @classmethod
     def load_from_file(cls, path: str | Path, name: str = "") -> "Datasets":
-        """Load samples from a JSONL file.
-
-        Each line should have:
-        - query: str (the question/prompt)
-        - rubrics: list[dict] (each with name, rubric, weight)
-        - reference_answer: str (optional)
-        - category: str (optional)
-        - difficulty: str (optional)
-        """
+        """Load samples from a JSONL file."""
         path = Path(path)
         samples = []
         with open(path, "r", encoding="utf-8") as f:
@@ -56,37 +66,27 @@ class Datasets:
                 if not line:
                     continue
                 row = json.loads(line)
-                sample = Sample(
+                samples.append(Sample(
                     input=row.get("query", row.get("input", row.get("question", ""))),
                     target=row.get("reference_answer", row.get("target", row.get("answer", ""))),
-                    id=row.get("id", row.get("query_id", f"q_{i+1}")),
-                    metadata=row.get("metadata", row.get("context")),
+                    id=row.get("id", f"q_{i+1}"),
                     rubrics=row.get("rubrics", []),
-                    reference_answer=row.get("reference_answer"),
-                    category=row.get("category", ""),
-                    difficulty=row.get("difficulty", "medium"),
-                    context=row.get("context"),
-                )
-                samples.append(sample)
+                    metadata=row.get("metadata", row.get("info", {})),
+                ))
         return cls(samples, name=name or path.stem)
 
     @classmethod
-    def from_dicts(cls, rows: list[dict], name: str = "") -> "Datasets":
+    def load_from_dict(cls, rows: list[dict], name: str = "") -> "Datasets":
         """Create from a list of dicts."""
         samples = []
         for i, row in enumerate(rows):
-            sample = Sample(
+            samples.append(Sample(
                 input=row.get("query", row.get("input", row.get("question", ""))),
                 target=row.get("reference_answer", row.get("target", row.get("answer", ""))),
-                id=row.get("id", row.get("query_id", f"q_{i+1}")),
-                metadata=row.get("metadata", row.get("context")),
+                id=row.get("id", f"q_{i+1}"),
                 rubrics=row.get("rubrics", []),
-                reference_answer=row.get("reference_answer"),
-                category=row.get("category", ""),
-                difficulty=row.get("difficulty", "medium"),
-                context=row.get("context"),
-            )
-            samples.append(sample)
+                metadata=row.get("metadata", row.get("info", {})),
+            ))
         return cls(samples, name=name)
 
     @classmethod
@@ -98,30 +98,27 @@ class Datasets:
         seed: int = 0,
         name: str = "",
     ) -> "Datasets":
-        """Load from a HuggingFace dataset (requires `datasets` package)."""
+        """Load from a HuggingFace dataset."""
         from tensoreval.utils.data_utils import load_example_dataset
         dataset = load_example_dataset(dataset_name, split=split, n=n, seed=seed)
         samples = []
         for i, row in enumerate(dataset):
-            sample = Sample(
+            samples.append(Sample(
                 input=row.get("question", row.get("input", "")),
                 target=row.get("answer", ""),
                 id=f"q_{i+1}",
-            )
-            samples.append(sample)
+            ))
         return cls(samples, name=name or dataset_name)
 
     def to_dicts(self) -> list[dict]:
-        """Convert samples to list of dicts."""
+        """Convert to list of dicts."""
         return [
             {
                 "query": s.input,
-                "rubrics": s.rubrics,
-                "reference_answer": s.reference_answer or s.target,
-                "category": s.category,
-                "difficulty": s.difficulty,
+                "reference_answer": s.target,
                 "id": s.id,
-                "context": s.context,
+                "rubrics": s.rubrics,
+                "metadata": s.metadata,
             }
             for s in self.samples
         ]
