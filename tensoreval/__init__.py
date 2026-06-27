@@ -14,6 +14,7 @@ from tensoreval.graders import Grader, RubricGrader, AgentGrader, RulerGrader
 from tensoreval.datasets import Datasets
 from tensoreval.evaluation import Evaluation, EvaluationResult
 from tensoreval.voice import VoiceMetrics
+from tensoreval.docker_compose import DockerCompose
 from tensoreval.mcp_tools import MCPTool, MCPServer, MCPToolRegistry
 from tensoreval.utils import extract_boxed_answer, extract_hash_answer
 
@@ -25,6 +26,7 @@ __all__ = [
     "Datasets",
     "Evaluation", "EvaluationResult",
     "VoiceMetrics",
+    "DockerCompose",
     "MCPTool", "MCPServer", "MCPToolRegistry",
     "extract_boxed_answer", "extract_hash_answer",
 ]
