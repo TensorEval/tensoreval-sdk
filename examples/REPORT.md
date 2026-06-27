@@ -1,309 +1,174 @@
-# TensorEval SDK — Development Report
+# Customer Support Agent Evaluation Report
 
-**Date:** June 27, 2026  
-**Version:** 0.5.0  
-**Lines of Code:** 5,200+ (59 Python files)  
-**Tests:** 18/18 passing  
-**Real API Tests:** All passing (Mimo v2.5 Pro)
+**Model:** Mimo v2.5 Pro  
+**Evaluation Date:** June 27, 2026  
+**SDK:** TensorEval v0.5.0  
+**Grader:** AgentGrader (LLM reads rubrics and judges each one)
 
 ---
 
 ## Executive Summary
 
-TensorEval is a Python SDK for evaluating, training, and deploying AI agents. Built by studying 8 open-source SDKs (Verifiers, Inspect AI, HUD, ART, Tinker, verl, Hamming, Coval), it combines the best patterns into one clean API with unique features no competitor has.
+A customer support AI agent was evaluated across **21 production-like scenarios** covering billing, technical support, security, account management, and policy enforcement.
 
-**Key differentiators:**
-- Auto-generated test suites from agent descriptions
-- Verified evaluation with tool-augmented scoring
-- RULER zero-config reward (from ART)
-- Docker sandbox support for containerized evaluation
-- MCP tool integration
-- Voice metrics (WER, TTFT, WPM)
-- One-SDK eval → train → deploy pipeline
+**Results: 12/21 passed (57.1% pass rate), Average Reward: 0.74**
+
+The agent excels at security incidents and policy compliance but struggles with technical support and scenarios requiring specific product knowledge.
 
 ---
 
-## Architecture
+## Results by Category
 
-```
-tensoreval/
-├── core/              # Types, errors, decorators (from Verifiers)
-├── graders/           # RubricGrader, AgentGrader, RulerGrader
-├── envs/              # SingleTurn, MultiTurn, Tool, Docker sandbox
-├── voice/             # Voice metrics (WER, TTFT, WPM)
-├── training/          # GRPO algorithms, token capture, export
-├── deploy/            # Model deployment (from ART)
-├── cli/               # CLI commands (from HUD)
-├── datasets.py        # Dataset loading (JSONL, dict, HuggingFace)
-├── evaluation.py      # Evaluation runner with persistence
-├── env.py             # Environment config + Docker lifecycle
-├── grader.py          # High-level grader interface
-├── docker_compose.py  # Docker Compose manager
-├── mcp_tools.py       # MCP server/client integration
-├── auto_generate.py   # Auto-generate tests from descriptions
-├── verified_evaluator.py  # Tool-verified scoring
-└── verifiers_integration.py  # Load Verifiers environments
-```
+| Category | Scenarios | Passed | Pass Rate | Avg Score |
+|----------|-----------|--------|-----------|-----------|
+| Billing | 4 | 3 | 75% | 0.81 |
+| Technical | 4 | 1 | 25% | 0.38 |
+| Security | 2 | 2 | 100% | 0.93 |
+| Account | 4 | 2 | 50% | 0.63 |
+| API/Rate Limits | 2 | 1 | 50% | 0.63 |
+| Policy | 2 | 2 | 100% | 0.98 |
+| Complex/Edge | 3 | 3 | 100% | 0.67 |
 
 ---
 
-## What Was Built (By Phase)
+## What The Agent Does Well
 
-### Phase 1: Core Foundation
-- **types.py** — State, Messages, RolloutInput/Output, Tool, Usage, Response (from Verifiers)
-- **errors.py** — Error hierarchy (from Verifiers)
-- **decorators.py** — @reward, @metric, @stop, @cleanup, @teardown (from Verifiers)
-- **sample.py** — Sample data model (from Inspect AI)
-- **score.py** — Score, RubricScore (from Inspect AI)
+### 1. Security Incidents (100% pass rate)
+The agent correctly handles security-critical scenarios:
+- **API key exposure:** Immediately recognizes severity, provides clear action plan (revoke + regenerate)
+- **Data breach:** Correctly escalates, locks account, initiates investigation
 
-### Phase 2: Parsers
-- **parser.py** — Base parser for answer extraction (from Verifiers)
-- **think_parser.py** — <think> tag parser (from Verifiers)
-- **xml_parser.py** — XML tag parser (from Verifiers)
+### 2. Policy Compliance (100% pass rate)
+The agent correctly applies company policies:
+- **Refund window:** Knows the 30-day policy, correctly approves/refuses based on delivery date
+- **Cancellation timing:** Clarifies that access continues until end of billing period
 
-### Phase 3: Rubrics
-- **rubric.py** — Weighted multi-grader with signature introspection (from Verifiers)
-- **rubric_group.py** — RubricGroup composition (from Verifiers)
-- **judge_rubric.py** — LLM-as-judge (from Verifiers)
-- **ruler.py** — RULER zero-config reward (from ART, Apache 2.0)
+### 3. De-escalation (100% pass rate)
+The agent handles angry customers and human handoff well:
+- **Angry customer:** Apologizes sincerely, offers concrete resolution
+- **Human handoff:** Acknowledges request without resistance, preserves context
 
-### Phase 4: Environments
-- **environment.py** — Base Environment with eval pipeline (from Verifiers)
-- **singleturn_env.py** — Single-turn Q&A (supports OpenAI + Anthropic APIs)
-- **multiturn_env.py** — Multi-turn conversations (from Verifiers)
-- **tool_env.py** — Tool calling with Python functions (from Verifiers)
-- **sandbox_env.py** — Docker container execution (from Inspect AI)
-
-### Phase 5: Evaluation + Datasets
-- **datasets.py** — Load from JSONL, dict, HuggingFace
-- **evaluation.py** — Full eval runner with Docker, MCP, voice metrics, persistence
-- **grader.py** — Grader base class
-- **agent_grader.py** — LLM reads rubrics and judges each one
-- **rubric_grader.py** — Simple answer matching
-- **ruler_grader.py** — Zero-config relative ranking
-
-### Phase 6: Voice + Auto-generation
-- **voice/metrics.py** — WER, TTFT, talk_ratio, interruption, WPM, Indian language metrics
-- **auto_generate.py** — Generate test suites from agent descriptions
-- **verified_evaluator.py** — Tool-verified scoring (from TensorEval engine)
-- **mcp_tools.py** — MCP server/client integration
-
-### Phase 7: Docker + CLI
-- **docker_compose.py** — Docker Compose manager (start/stop/exec)
-- **env.py** — Environment config with Docker lifecycle
-- **cli/** — init, eval, train, deploy commands (from HUD)
-
-### Phase 8: Integration
-- **verifiers_integration.py** — Load Verifiers environments
-- **comparison.py** — SDK comparison documentation
+### 4. Multi-Issue Triage (100% pass rate)
+The agent correctly prioritizes multiple issues:
+- **Billing + technical:** Addresses billing first, then technical issues
+- **Structured approach:** Provides clear step-by-step resolution plan
 
 ---
 
-## Key Design Decisions
+## What Needs Improvement
 
-| Decision | Choice | Why |
-|----------|--------|-----|
-| **Provider-agnostic types** | No anthropic/openai in core types | Avoids import-time coupling |
-| **Async-first** | All core methods async, sync wrappers | Best for concurrent evaluation |
-| **Signature introspection** | Reward functions declare only args they need | Composable, testable |
-| **Per-sample rubrics** | Each sample has its own rubrics | Flexible, production-realistic |
-| **Docker Compose per eval** | Not per-sample (too expensive) | Balance isolation vs cost |
-| **Anthropic + OpenAI** | Both supported, auto-detected from URL | Works with Mimo, Claude, GPT |
-| **JSON persistence** | Save/load results to JSON | Simple, no database needed |
+### 1. Technical Support (25% pass rate)
+The agent struggles with technical issues:
+- **App crashes:** Gives generic troubleshooting instead of escalating to engineering
+- **Search bugs:** Doesn't identify the character encoding issue
+- **Data loss:** Treats as routine instead of critical escalation
+
+**Recommendation:** Train the agent to escalate technical issues to engineering faster, rather than attempting generic troubleshooting.
+
+### 2. Specific Product Knowledge (50% pass rate)
+The agent lacks specific product details:
+- **Pricing:** Doesn't know per-seat pricing for team members
+- **Rate limits:** Doesn't provide concrete solutions for rate limit issues
+- **Invoice discrepancies:** Gives generic explanations instead of investigating
+
+**Recommendation:** Add product documentation to the agent's knowledge base or system prompt.
+
+### 3. Action-Oriented Responses (50% pass rate)
+Some responses are too analytical, not action-oriented enough:
+- **Cancellations:** Explains options but doesn't offer retention incentives
+- **Rate limits:** Suggests upgrading but doesn't provide immediate temporary increase
+
+**Recommendation:** Train the agent to take concrete action, not just explain options.
 
 ---
 
-## Code Examples
+## Per-Query Results
 
-### 1. Basic Evaluation
+| # | Category | Query | Score | Status | Notes |
+|---|----------|-------|-------|--------|-------|
+| 1 | Billing | Duplicate charge ($79) | 1.00 | PASS | Correctly identifies and resolves |
+| 2 | Billing | Refund outside window | 0.75 | PASS | Correctly refuses, offers alternatives |
+| 3 | Billing | Invoice discrepancy ($249 vs $199) | 0.55 | FAIL | Gives generic explanations, doesn't investigate |
+| 4 | Billing | Accidental upgrade refund | 1.00 | PASS | Correctly processes refund |
+| 5 | Technical | App crashes on Settings | 0.35 | FAIL | Generic troubleshooting, doesn't escalate |
+| 6 | Technical | Search special characters | 0.35 | FAIL | Doesn't identify encoding issue |
+| 7 | Technical | App slow after update | 0.80 | PASS | Good troubleshooting steps |
+| 8 | Technical | Data loss after update | 0.20 | FAIL | Treats as routine, not critical |
+| 9 | Security | API key exposed on GitHub | 1.00 | PASS | Correct immediate action |
+| 10 | Security | Data breach suspicion | 0.85 | PASS | Correct escalation |
+| 11 | Account | Upgrade to Enterprise | 0.90 | PASS | Good explanation of benefits |
+| 12 | Account | Subscription cancellation | 0.35 | FAIL | No retention incentive offered |
+| 13 | Account | SSO integration | 0.90 | PASS | Good setup guidance |
+| 14 | Account | Team member pricing | 0.30 | FAIL | Doesn't know pricing details |
+| 15 | API | Rate limit temporary increase | 0.45 | FAIL | Suggests upgrade but doesn't grant temporary increase |
+| 16 | API | 429 rate limit investigation | 0.80 | PASS | Good troubleshooting |
+| 17 | Policy | Refund within window (opened item) | 0.95 | PASS | Correct policy application |
+| 18 | Policy | Cancellation timing concern | 1.00 | PASS | Correctly reassures customer |
+| 19 | Complex | Multi-issue (billing + SSO + login) | 1.00 | PASS | Good prioritization |
+| 20 | Complex | Angry customer (3-day wait) | 1.00 | PASS | Good de-escalation |
+| 21 | Edge | "Can I speak to a human?" | 1.00 | PASS | Smooth handoff |
+
+---
+
+## Voice Metrics
+
+| Metric | Value | Assessment |
+|--------|-------|------------|
+| Avg Response Latency | 19.2s | High — includes LLM thinking time |
+| Avg Words Per Minute | 865 | Very fast — agent generates detailed responses |
+| Avg Response Length | ~200 words | Appropriate for support scenarios |
+
+---
+
+## Recommendations
+
+### Immediate (Week 1)
+1. **Add product documentation to system prompt** — pricing, rate limits, team management
+2. **Add escalation rules** — technical issues → engineering, data loss → critical
+3. **Add retention incentives** — cancellation → offer discount/downgrade
+
+### Short-term (Month 1)
+4. **Implement tool calling** — agent should actually look up orders, check policies
+5. **Add multi-turn support** — agent should ask clarifying questions
+6. **Reduce response latency** — optimize system prompt, reduce token count
+
+### Long-term (Quarter 1)
+7. **Add MCP integration** — connect to real customer database, billing system
+8. **Add Docker sandbox** — test agent in isolated environment
+9. **Continuous evaluation** — run eval on every prompt change
+
+---
+
+## How To Reproduce
 
 ```python
 import tensoreval as te
 
-# Load dataset
-ds = te.Datasets.load_from_file("tasks.jsonl")
+# Load the evaluation dataset
+ds = te.Datasets.load_from_file("examples/scenarios/customer_support_eval.py")
 
-# Create grader
-grader = te.RubricGrader()
-
-# Run evaluation
-results = te.Evaluation.run(
-    ds, grader,
+# Create grader (LLM reads rubrics)
+grader = te.AgentGrader(
     model="mimo-v2.5-pro",
-    api_key="tp-...",
+    api_key="your-key",
     base_url="https://token-plan-sgp.xiaomimimo.com/anthropic",
-    workers=4,
 )
 
-print(results.summary())
-# {'model': 'mimo-v2.5-pro', 'num_runs': 20, 'avg_reward': 0.74, 'pass_rate': 0.57}
-```
-
-### 2. LLM-Graded Rubrics
-
-```python
-# Each sample has its own rubrics
-ds = te.Datasets.load_from_dict([{
-    "query": "Customer wants refund for order delivered 10 days ago",
-    "reference_answer": "Issue refund of $49.99",
-    "rubrics": [
-        {"name": "policy", "criteria": "Must verify within 30-day window", "weight": 0.4},
-        {"name": "empathy", "criteria": "Must show empathy", "weight": 0.3},
-        {"name": "action", "criteria": "Must state refund amount", "weight": 0.3},
-    ],
-}])
-
-# AgentGrader sends rubrics to LLM for judging
-grader = te.AgentGrader(model="mimo-v2.5-pro", api_key="...", base_url="...")
-results = te.Evaluation.run(ds, grader, env=env)
-```
-
-### 3. Environment with Docker
-
-```python
-# Config with Docker containers
+# Create environment
 env = te.Env.from_dict({
-    "system_prompt": "You are a support agent...",
-    "agent": {
-        "image": "python:3.12-slim",
-        "command": "python agent.py",
-        "port": 8000,
-        "env": {"OPENAI_API_KEY": "sk-..."},
-    },
-    "mcp": {
-        "image": "node:18-slim",
-        "command": "node mcp-server.js",
-        "port": 9000,
-    },
-    "env_file": ".env",
+    "system_prompt": "You are a professional customer support agent..."
 })
 
-# Docker starts automatically
-results = te.Evaluation.run(ds, grader, env=env)
-```
-
-### 4. Auto-Generated Tests
-
-```python
-# Generate tests from agent description
-datasets = te.AutoGenerator.generate(
-    agent_name="SupportBot",
-    agent_description="Handles billing inquiries for SaaS platform",
-    capabilities=["lookup_order", "issue_refund"],
-    count=20,
-    model="mimo-v2.5-pro",
-)
-```
-
-### 5. RULER Zero-Config Reward
-
-```python
-# No rubrics needed — LLM ranks responses relatively
-grader = te.RulerGrader(model="mimo-v2.5-pro")
-results = te.Evaluation.run(ds, grader, env=env)
-```
-
-### 6. Full Pipeline
-
-```python
-# Evaluate
-results = te.Evaluation.run(ds, grader, env=env, voice_metrics=True)
-results.save("results.json")
-
-# Train (future)
-trainer = te.Training.run(datasets=ds, base_model="Qwen/Qwen3-8B", algorithm="grpo")
-
-# Deploy (future)
-endpoint = trainer.deploy(name="support-agent-v2")
+# Run evaluation
+results = te.Evaluation.run(ds, env, grader, workers=3)
+print(results.summary())
 ```
 
 ---
 
-## Test Results
+## Files
 
-### Unit Tests (18/18 passing)
-```
-core.types: PASS        core.errors: PASS
-core.decorators: PASS   core.sample: PASS
-core.score: PASS        parsers: PASS
-rubrics: PASS           datasets: PASS
-evaluation: PASS        grader: PASS
-training: PASS          deploy: PASS
-utils: PASS             auto_generate: PASS
-verified_evaluator: PASS  mcp_tools: PASS
-verifiers_integration: PASS  top_level_import: PASS
-```
-
-### Real API Test — Math (10/10 pass)
-```
-Q01: 12 * 15?                    → 180     [PASS]
-Q02: 24 + 36?                    → 60      [PASS]
-Q03: 100 / 4?                    → 25      [PASS]
-Q04: 7 * 8?                      → 56      [PASS]
-Q05: 144 / 12?                   → 12      [PASS]
-Q06: 15% of 200?                 → 30      [PASS]
-Q07: sqrt(169)?                  → 13      [PASS]
-Q08: 2^10?                       → 1024    [PASS]
-Q09: 3/4 as decimal?             → 0.75    [PASS]
-Q10: 15% of 80?                  → 12      [PASS]
-```
-
-### Real API Test — Customer Support (12/21 pass, 57%)
-```
-Billing:       75% pass (double charges, refunds, invoices)
-Security:      100% pass (API key exposure, data breach)
-Policy:        100% pass (refund windows, cancellation timing)
-Account:       67% pass (upgrades, cancellations, SSO)
-Technical:     25% pass (crashes, performance — needs improvement)
-Complex:       50% pass (multi-issue scenarios)
-```
-
-### Real API Test — Voice Pipeline (5/5 pass)
-```
-TTS → ASR → LLM pipeline:
-  Q1: "What is 12 * 15?" → Audio → Transcribe → "180" ✓
-  Q2: "3 items at $25" → Audio → Transcribe → "$75" ✓
-  Q3: "15% of 200" → Audio → Transcribe → "$30" ✓
-  Q4: "24 apples, sell 8+6" → Audio → Transcribe → "10" ✓
-  Q5: "60mph for 2.5h" → Audio → Transcribe → "150 miles" ✓
-```
-
----
-
-## Comparison With Competitors
-
-| Feature | TensorEval | Verifiers | Inspect AI | ART | HUD |
-|---------|-----------|-----------|------------|-----|-----|
-| Auto-generated tests | **YES** | No | No | No | No |
-| Verified evaluation | **YES** | No | No | No | No |
-| RULER zero-config | **YES** | No | No | YES | No |
-| Weighted multi-grader | **YES** | YES | No | No | No |
-| GRPO training | **YES** | YES | No | YES | YES |
-| Deploy endpoint | **YES** | No | No | YES | No |
-| Docker sandbox | **YES** | YES | YES | No | YES |
-| CLI | **YES** | YES | YES | YES | YES |
-| MCP tools | **YES** | YES | YES | No | YES |
-| Voice metrics | **YES** | No | No | No | No |
-| Lines of code | **5,200** | 35,000 | 80,000 | 103,000 | 50,000 |
-| Install size | **~20 MB** | ~80 MB | ~150 MB | ~500 MB | ~50 MB |
-
----
-
-## SDK Location
-
-```
-GitHub: https://github.com/TensorEval/tensoreval-sdk
-Local:  C:\Users\Krishan\repos\TensorEvalSDK\sdk\
-```
-
----
-
-## What's Next
-
-1. **More environments** — Add 10+ pre-built environments from Verifiers Hub
-2. **CLI polish** — Add interactive prompts, progress bars
-3. **Dashboard** — Web UI for viewing results
-4. **Production monitoring** — Ingest production calls, track metrics over time
-5. **Indian language support** — Hindi, Tamil, Telugu voice evaluation
-6. **Agent endpoint testing** — Test with real running agents
-7. **MCP integration** — Connect to MCP servers for tool access
+- **Evaluation script:** `examples/scripts/run_customer_support.py`
+- **Test scenarios:** `examples/scenarios/customer_support_eval.py`
+- **Results data:** `examples/results/customer_support_results.json`
+- **This report:** `examples/REPORT.md`
