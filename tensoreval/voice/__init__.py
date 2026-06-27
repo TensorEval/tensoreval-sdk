@@ -1,8 +1,4 @@
-"""Voice evaluation module for TensorEval.
-
-Provides voice-specific metrics, Indian language support,
-and integration with voice AI platforms.
-"""
+"""Voice evaluation module for TensorEval."""
 
 from tensoreval.voice.metrics import VoiceMetrics, IndianLanguageMetrics, AudioMetrics
 
