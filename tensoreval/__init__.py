@@ -3,10 +3,10 @@
 Usage:
     import tensoreval as te
 
-    env = te.Env.load_from_file("config.yaml")
-    ds = te.Datasets.load_from_dict([...])
+    env = te.Env.from_dict({"system_prompt": "..."})
+    ds = te.Datasets.load_from_file("tasks.jsonl")
     grader = te.RubricGrader()
-    results = te.Evaluation.run(ds, env, grader, workers=4, agent_port=8000, mcp_port=9000)
+    results = te.Evaluation.run(ds, env, grader, workers=4)
 """
 
 from tensoreval.env import Env
