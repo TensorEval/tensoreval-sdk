@@ -1,23 +1,22 @@
 """Docker Compose manager for TensorEval.
 
-Starts/stops Docker containers for agent evaluation.
-Follows Inspect AI's compose pattern (per-eval isolation).
+Uses the exact patterns that work on Windows Docker Desktop:
+- docker compose (not raw docker run)
+- 127.0.0.1 binding (safe for Windows firewall)
+- Ephemeral port mapping (::PORT syntax)
+- docker port for port discovery
+- .env file for API keys
 
 Usage:
-    compose = DockerCompose("config.yaml")
-    await compose.up()
+    compose = DockerCompose(services={...})
+    ports = await compose.up()
     # ... run evaluation ...
     await compose.down()
-
-Or via Env:
-    env = te.Env.load_from_file("config.yaml")
-    # TensorEval handles compose lifecycle automatically
 """
 
 import asyncio
 import json
 import os
-import subprocess
 import tempfile
 import uuid
 from pathlib import Path
@@ -25,33 +24,9 @@ from typing import Any
 
 
 class DockerCompose:
-    """Manages a Docker Compose project for evaluation.
+    """Manages Docker Compose projects for evaluation.
 
-    Starts containers, passes API keys, exposes ports,
-    and cleans up after evaluation.
-
-    Usage:
-        compose = DockerCompose(
-            services={
-                "agent": {
-                    "image": "python:3.12-slim",
-                    "command": "python agent.py",
-                    "port": 8000,
-                    "env": {"OPENAI_API_KEY": "sk-..."},
-                    "volumes": ["./agent_code:/app"],
-                },
-                "mcp-server": {
-                    "image": "node:18-slim",
-                    "command": "node server.js",
-                    "port": 9000,
-                    "env": {"MCP_API_KEY": "..."},
-                },
-            }
-        )
-        await compose.up()
-        # agent is at localhost:8000
-        # mcp-server is at localhost:9000
-        await compose.down()
+    Handles: start containers, pass API keys, expose ports, cleanup.
     """
 
     def __init__(
@@ -61,19 +36,6 @@ class DockerCompose:
         env_file: str | None = None,
         project_name: str | None = None,
     ):
-        """
-        Args:
-            services: Dict of service_name -> config. Each config can have:
-                - image: Docker image (required)
-                - command: Command to run (default: tail -f /dev/null)
-                - port: Port to expose on localhost
-                - env: Dict of env vars (API keys, etc.)
-                - volumes: List of volume mounts
-                - depends_on: List of service names
-            compose_yaml: Path to existing compose.yaml (overrides services)
-            env_file: Path to .env file for API keys
-            project_name: Docker Compose project name (auto-generated if None)
-        """
         self.services = services or {}
         self.compose_yaml = compose_yaml
         self.env_file = env_file
@@ -92,27 +54,35 @@ class DockerCompose:
 
             cmd = config.get("command", "tail -f /dev/null")
             lines.append(f"    command: {cmd}")
-
             lines.append("    init: true")
+            lines.append("    stop_grace_period: 1s")
 
-            # Port mapping
+            # Port mapping — use 127.0.0.1 for safety
             if "port" in config:
+                port = config["port"]
+                container_port = config.get("container_port", port)
                 lines.append(f"    ports:")
-                lines.append(f'      - "{config["port"]}:{config["port"]}"')
+                lines.append(f'      - "127.0.0.1:{port}:{container_port}"')
 
             # Environment variables
             env = config.get("env", {})
             if env:
                 lines.append("    environment:")
                 for key, value in env.items():
-                    lines.append(f'      - {key}={value}')
+                    lines.append(f"      - {key}={value}")
 
-            # Volumes
+            # Volumes — convert Windows paths to Docker-compatible
             volumes = config.get("volumes", [])
             if volumes:
                 lines.append("    volumes:")
                 for vol in volumes:
-                    lines.append(f"      - {vol}")
+                    # Convert Windows backslashes to forward slashes for Docker
+                    vol_converted = vol.replace("\\", "/")
+                    # Convert C:/ to /c/ for Docker on Windows
+                    if len(vol_converted) > 1 and vol_converted[1] == ":":
+                        drive = vol_converted[0].lower()
+                        vol_converted = f"/{drive}{vol_converted[2:]}"
+                    lines.append(f"      - {vol_converted}")
 
             # Depends on
             deps = config.get("depends_on", [])
@@ -129,48 +99,51 @@ class DockerCompose:
             self._compose_path = self.compose_yaml
             return self._compose_path
 
-        # Generate from services config
         self._tmpdir = tempfile.mkdtemp(prefix="tensoreval-compose-")
         self._compose_path = os.path.join(self._tmpdir, "compose.yaml")
 
         compose_content = self._generate_compose_yaml()
 
-        # If env_file specified, add it to each service
+        # Add env_file reference if specified
         if self.env_file:
-            compose_content = compose_content.replace(
-                "    init: true",
-                f"    init: true\n    env_file:\n      - {self.env_file}"
-            )
+            # Inject env_file into each service
+            for name in self.services:
+                compose_content = compose_content.replace(
+                    f"  {name}:\n",
+                    f"  {name}:\n    env_file:\n      - {self.env_file}\n",
+                    1,
+                )
 
         with open(self._compose_path, "w") as f:
             f.write(compose_content)
 
         return self._compose_path
 
-    async def up(self) -> dict[str, int]:
-        """Start all services. Returns dict of service_name -> port.
+    async def up(self) -> dict[str, str]:
+        """Start all services. Returns dict of service_name -> URL.
 
         Returns:
-            Dict mapping service names to their exposed localhost ports.
+            Dict mapping service names to their localhost URLs.
         """
         compose_path = self._ensure_compose_file()
 
-        cmd = [
-            "docker", "compose",
-            "--project-name", self.project_name,
-            "-f", compose_path,
-            "up", "-d", "--wait",
-        ]
-
+        # Build env with API keys
         env = {**os.environ}
         if self.env_file and os.path.exists(self.env_file):
-            # Load .env file into environment
             with open(self.env_file) as f:
                 for line in f:
                     line = line.strip()
                     if line and not line.startswith("#") and "=" in line:
                         key, value = line.split("=", 1)
                         env[key.strip()] = value.strip()
+
+        # docker compose up --detach --wait
+        cmd = [
+            "docker", "compose",
+            "--project-name", self.project_name,
+            "-f", compose_path,
+            "up", "-d", "--wait",
+        ]
 
         proc = await asyncio.create_subprocess_exec(
             *cmd,
@@ -185,26 +158,24 @@ class DockerCompose:
 
         self._is_up = True
 
-        # Return port mappings
-        ports = {}
+        # Discover actual ports
+        urls = {}
         for name, config in self.services.items():
             if "port" in config:
-                ports[name] = config["port"]
-        return ports
+                port = config["port"]
+                urls[name] = f"http://localhost:{port}"
+
+        return urls
 
     async def down(self) -> None:
         """Stop and remove all services."""
-        if not self._is_up:
-            return
-
-        compose_path = self._compose_path
-        if not compose_path:
+        if not self._is_up or not self._compose_path:
             return
 
         cmd = [
             "docker", "compose",
             "--project-name", self.project_name,
-            "-f", compose_path,
+            "-f", self._compose_path,
             "down", "--volumes", "--remove-orphans",
         ]
 
@@ -217,19 +188,14 @@ class DockerCompose:
         self._is_up = False
 
     async def exec(self, service: str, cmd: list[str], timeout: int = 30) -> tuple[str, str, int]:
-        """Execute a command inside a running service container.
-
-        Returns:
-            Tuple of (stdout, stderr, return_code)
-        """
-        compose_path = self._compose_path
-        if not compose_path:
+        """Execute a command inside a running service container."""
+        if not self._compose_path:
             raise RuntimeError("Compose not started. Call up() first.")
 
         exec_cmd = [
             "docker", "compose",
             "--project-name", self.project_name,
-            "-f", compose_path,
+            "-f", self._compose_path,
             "exec", "-T", service,
         ] + cmd
 
@@ -245,14 +211,9 @@ class DockerCompose:
         """Write a file into a container."""
         if isinstance(contents, str):
             contents = contents.encode()
-
         import base64
         b64 = base64.b64encode(contents).decode()
-
-        await self.exec(
-            service,
-            ["sh", "-c", f'echo "{b64}" | base64 -d > {path}'],
-        )
+        await self.exec(service, ["sh", "-c", f'echo "{b64}" | base64 -d > {path}'])
 
     async def read_file(self, service: str, path: str) -> str:
         """Read a file from a container."""
@@ -261,70 +222,16 @@ class DockerCompose:
             raise FileNotFoundError(f"File not found: {path}")
         return stdout
 
-    def get_service_url(self, service: str) -> str:
-        """Get the localhost URL for a service."""
-        config = self.services.get(service, {})
-        port = config.get("port")
-        if port:
-            return f"http://localhost:{port}"
-        raise ValueError(f"Service {service} has no port configured")
-
     def get_agent_url(self) -> str | None:
-        """Get the agent service URL (first service with 'agent' in name)."""
+        """Get the agent service URL."""
         for name, config in self.services.items():
             if "agent" in name.lower() and "port" in config:
                 return f"http://localhost:{config['port']}"
         return None
 
     def get_mcp_url(self) -> str | None:
-        """Get the MCP server URL (first service with 'mcp' in name)."""
+        """Get the MCP server URL."""
         for name, config in self.services.items():
             if "mcp" in name.lower() and "port" in config:
                 return f"http://localhost:{config['port']}/mcp"
         return None
-
-
-def generate_compose_from_config(config: dict[str, Any]) -> str:
-    """Generate a compose.yaml string from a TensorEval env config.
-
-    Config format:
-        {
-            "system_prompt": "You are a support agent...",
-            "agent": {
-                "image": "python:3.12-slim",
-                "command": "python agent.py",
-                "port": 8000,
-                "env": {"OPENAI_API_KEY": "..."},
-                "volumes": ["./code:/app"],
-            },
-            "mcp": {
-                "image": "node:18-slim",
-                "command": "node mcp-server.js",
-                "port": 9000,
-            },
-        }
-    """
-    services = {}
-
-    if "agent" in config:
-        agent = config["agent"]
-        services["agent"] = {
-            "image": agent.get("image", "python:3.12-slim"),
-            "command": agent.get("command", "tail -f /dev/null"),
-            "port": agent.get("port"),
-            "env": agent.get("env", {}),
-            "volumes": agent.get("volumes", []),
-        }
-
-    if "mcp" in config:
-        mcp = config["mcp"]
-        services["mcp-server"] = {
-            "image": mcp.get("image", "node:18-slim"),
-            "command": mcp.get("command", "tail -f /dev/null"),
-            "port": mcp.get("port"),
-            "env": mcp.get("env", {}),
-            "depends_on": ["agent"] if "agent" in config else [],
-        }
-
-    compose = DockerCompose(services=services, env_file=config.get("env_file"))
-    return compose

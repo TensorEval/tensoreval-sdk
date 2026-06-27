@@ -1,21 +1,30 @@
-"""Env — Environment loader for TensorEval.
+"""Env — Environment configuration and lifecycle manager.
 
-Loads environment configuration from files (YAML, JSON, Python).
-Manages Docker containers, API keys, MCP servers, and agent endpoints.
+Handles:
+- System prompt
+- Docker container management (start/stop)
+- API key injection
+- MCP server connection
+- Agent endpoint connection
 
 Usage:
-    # From config.yaml (auto-generates Docker compose)
-    env = te.Env.load_from_file("config.yaml")
+    # Simple (no Docker)
+    env = te.Env.from_dict({"system_prompt": "..."})
 
-    # From dict
+    # With Docker
     env = te.Env.from_dict({
-        "system_prompt": "You are a support agent...",
-        "agent": {"image": "python:3.12", "port": 8000, "env": {"OPENAI_KEY": "..."}},
-        "mcp": {"image": "node:18", "port": 9000},
+        "system_prompt": "...",
+        "agent": {"image": "python:3.12-slim", "port": 8000, "env": {"KEY": "val"}},
+        "mcp": {"image": "node:18-slim", "port": 9000},
+        "env_file": ".env",
     })
 
-    # Use in evaluation (Docker starts automatically)
-    results = te.Evaluation.run(ds, grader, env=env)
+    # With direct URLs (no Docker)
+    env = te.Env.from_dict({
+        "system_prompt": "...",
+        "agent_url": "http://localhost:8000",
+        "mcp_url": "http://localhost:9000/mcp",
+    })
 """
 
 import os
@@ -24,21 +33,7 @@ from typing import Any, Callable
 
 
 class Env:
-    """Environment configuration and lifecycle manager.
-
-    Handles:
-    - System prompt for the agent
-    - Docker container management (start/stop)
-    - API key injection into containers
-    - MCP server connection
-    - Agent endpoint connection
-
-    Docker lifecycle:
-        env = te.Env.from_dict({...})
-        await env.start()   # starts containers, passes API keys
-        # ... run evaluation ...
-        await env.stop()    # cleans up containers
-    """
+    """Environment configuration and lifecycle manager."""
 
     def __init__(
         self,
@@ -61,8 +56,8 @@ class Env:
         self.compose_yaml = compose_yaml
         self.mcp_url = mcp_url
         self.agent_url = agent_url
-        self.agent = agent  # Docker service config for agent
-        self.mcp = mcp      # Docker service config for MCP server
+        self.agent = agent
+        self.mcp = mcp
         self.env_file = env_file
         self.config = config or {}
         self._compose = None
@@ -70,10 +65,7 @@ class Env:
 
     @classmethod
     def load_from_file(cls, path: str | Path) -> "Env":
-        """Load environment from a file.
-
-        Supports: .yaml, .yml, .json, .py, Dockerfile
-        """
+        """Load environment from YAML, JSON, or Python file."""
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(f"File not found: {path}")
@@ -90,28 +82,7 @@ class Env:
 
     @classmethod
     def from_dict(cls, config: dict[str, Any]) -> "Env":
-        """Create environment from a dict config.
-
-        Config format:
-            {
-                "system_prompt": "You are a support agent...",
-                "agent": {
-                    "image": "python:3.12-slim",
-                    "command": "python agent.py",
-                    "port": 8000,
-                    "env": {"OPENAI_API_KEY": "..."},
-                    "volumes": ["./code:/app"],
-                },
-                "mcp": {
-                    "image": "node:18-slim",
-                    "command": "node mcp-server.js",
-                    "port": 9000,
-                },
-                "env_file": ".env",
-                "agent_url": "http://localhost:8000",  # direct URL, no Docker
-                "mcp_url": "http://localhost:9000/mcp",  # direct URL, no Docker
-            }
-        """
+        """Create from dict config."""
         return cls(
             system_prompt=config.get("system_prompt"),
             tools=config.get("tools"),
@@ -128,26 +99,21 @@ class Env:
 
     @classmethod
     def _load_yaml(cls, path: Path) -> "Env":
-        """Load from YAML config file."""
         try:
             import yaml
         except ImportError:
-            raise ImportError("PyYAML required. Install with: pip install pyyaml")
+            raise ImportError("PyYAML required. Install: pip install pyyaml")
         with open(path) as f:
-            config = yaml.safe_load(f)
-        return cls.from_dict(config)
+            return cls.from_dict(yaml.safe_load(f))
 
     @classmethod
     def _load_json(cls, path: Path) -> "Env":
-        """Load from JSON config file."""
         import json
         with open(path) as f:
-            config = json.load(f)
-        return cls.from_dict(config)
+            return cls.from_dict(json.load(f))
 
     @classmethod
     def _load_python(cls, path: Path) -> "Env":
-        """Load from Python file (must define load_environment())."""
         import importlib.util
         spec = importlib.util.spec_from_file_location("env_module", path)
         module = importlib.util.module_from_spec(spec)
@@ -168,17 +134,17 @@ class Env:
         """Start Docker containers if configured.
 
         Returns:
-            Dict of service_name -> URL (e.g., {"agent": "http://localhost:8000"})
+            Dict of service_name -> URL
         """
         if self._started:
             return self._get_urls()
 
-        # If direct URLs are set, no Docker needed
+        # If direct URLs set, no Docker needed
         if self.agent_url and not self.agent:
             self._started = True
             return self._get_urls()
 
-        # Build Docker compose from agent/mcp config
+        # Build Docker compose from config
         if self.agent or self.mcp:
             from tensoreval.docker_compose import DockerCompose
 
@@ -194,26 +160,24 @@ class Env:
                 env_file=self.env_file,
             )
 
-            ports = await self._compose.up()
+            urls = await self._compose.up()
 
-            # Wire URLs from Docker ports
-            if "agent" in ports:
-                self.agent_url = f"http://localhost:{ports['agent']}"
-            if "mcp-server" in ports:
-                self.mcp_url = f"http://localhost:{ports['mcp-server']}/mcp"
+            if "agent" in urls:
+                self.agent_url = urls["agent"]
+            if "mcp-server" in urls:
+                self.mcp_url = urls["mcp-server"] + "/mcp"
 
         self._started = True
         return self._get_urls()
 
     async def stop(self) -> None:
-        """Stop Docker containers if running."""
+        """Stop Docker containers."""
         if self._compose:
             await self._compose.down()
             self._compose = None
         self._started = False
 
     def _get_urls(self) -> dict[str, str]:
-        """Get service URLs."""
         urls = {}
         if self.agent_url:
             urls["agent"] = self.agent_url
@@ -237,7 +201,7 @@ class Env:
         if self.mcp_url:
             parts.append(f"mcp_url={self.mcp_url}")
         if self.agent:
-            parts.append(f"agent=docker")
+            parts.append("agent=docker")
         if self.mcp:
-            parts.append(f"mcp=docker")
+            parts.append("mcp=docker")
         return f"Env({', '.join(parts)})"
