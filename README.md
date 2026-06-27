@@ -1,248 +1,271 @@
 # TensorEval SDK
 
-**Evaluation, Training, and Deployment for AI Agents.**
-
-TensorEval takes the best patterns from 8 open-source projects (Verifiers, ART, HUD, Inspect AI, Tinker, verl) and combines them into one clean API with 9 CLI commands.
+**Evaluation SDK for AI Agents — Docker, MCP, Voice, and more.**
 
 ## Quick Start
 
 ```bash
-pip install tensoreval
+pip install git+https://github.com/TensorEval/tensoreval-sdk.git
 ```
 
 ```python
 import tensoreval as te
 
-# Load a built-in environment
-env = te.load_env("gsm8k", n=10)
+# Load dataset
+ds = te.Datasets.load_from_file("tasks.jsonl")
 
-# Evaluate with real API
-results = te.Evaluation.run(
-    datasets=te.Datasets.from_dicts(env.dataset),
-    grader=env.rubric,
-    env=env,
-    model="mimo-v2.5-pro",
-    api_key="your-key",
-    base_url="https://api.anthropic.com",
-)
+# Create grader
+grader = te.RubricGrader()
+
+# Run evaluation against your agent
+results = te.Evaluation.run(ds, grader, agent_port=8000)
 print(results.summary())
-```
-
-## CLI
-
-```bash
-# List built-in environments
-tensoreval envs
-
-# Evaluate a model
-tensoreval eval gsm8k --model mimo-v2.5-pro --n 10
-
-# Evaluate with custom dataset
-tensoreval eval tasks.jsonl --model mimo-v2.5-pro --judge
-
-# Scaffold a new environment
-tensoreval init my-agent --preset cx
-
-# Train with GRPO
-tensoreval train tasks.jsonl --base-model Qwen/Qwen3-8B --algorithm grpo
-
-# Deploy trained model
-tensoreval deploy <run-id> --name my-agent-v2 --provider together
-
-# Show version and Docker status
-tensoreval version
-```
-
-## Built-in Environments
-
-| Environment | Category | Description |
-|-------------|----------|-------------|
-| `gsm8k` | math | Grade-school math problems |
-| `math` | math | Competition math problems |
-| `code-generation` | coding | Python code generation tasks |
-| `customer-support` | business | Customer support agent scenarios |
-| `data-analysis` | analytics | Business data analysis tasks |
-| `reasoning` | reasoning | Logic and reasoning puzzles |
-
-```python
-# Load any built-in environment
-env = te.load_env("customer-support", n=20)
-env = te.load_env("code-generation", n=10)
-env = te.load_env("reasoning", n=15)
 ```
 
 ## Features
 
-### Auto-Generated Tests (Unique)
+| Feature | Status | Description |
+|---------|--------|-------------|
+| **Docker Compose** | Working | Run agent in container, evaluate automatically |
+| **Agent Endpoint** | Working | Test any HTTP endpoint (OpenAI-compatible) |
+| **MCP Tools** | Working | Connect to MCP servers for tool access |
+| **RubricGrader** | Working | Rule-based scoring with weighted rubrics |
+| **AgentGrader** | Working | LLM reads rubrics and judges each one |
+| **RulerGrader** | Working | Zero-config relative ranking |
+| **Voice Metrics** | Working | TTFT, WPM, latency tracking |
+| **Auto-generation** | Working | Generate tests from agent description |
+| **Persistence** | Working | Save/load results to JSON |
+| **Real API Tested** | Working | Tested with Mimo v2.5 Pro |
+
+## Usage Examples
+
+### 1. Evaluate with RubricGrader (simple answer matching)
 
 ```python
-# Generate test suite from agent description
-datasets = te.AutoGenerator.generate(
-    agent_name="SupportBot",
-    agent_description="Handles billing inquiries for SaaS platform",
-    capabilities=["lookup_order", "issue_refund"],
-    count=20,
-    model="mimo-v2.5-pro",
-)
+import tensoreval as te
+
+ds = te.Datasets.load_from_dict([
+    {"query": "What is 2+2?", "reference_answer": "4"},
+    {"query": "What is 10*5?", "reference_answer": "50"},
+])
+
+grader = te.RubricGrader()
+env = te.Env.from_dict({"system_prompt": "Answer concisely."})
+
+results = te.Evaluation.run(ds, grader, env=env, model="mimo-v2.5-pro", api_key="...", base_url="...")
+print(results.summary())
 ```
 
-### Verified Evaluation (Unique)
+### 2. Evaluate with AgentGrader (LLM judges rubrics)
 
 ```python
-# Evaluator runs code, reads files, searches web to VERIFY answers
-grader = te.Grader(model="mimo-v2.5-pro", verified=True)
+ds = te.Datasets.load_from_dict([{
+    "query": "Customer wants refund for order delivered 10 days ago",
+    "reference_answer": "Issue refund of $49.99",
+    "rubrics": [
+        {"name": "policy", "criteria": "Must verify within 30-day window", "weight": 0.4},
+        {"name": "empathy", "criteria": "Must show empathy", "weight": 0.3},
+        {"name": "action", "criteria": "Must state refund amount", "weight": 0.3},
+    ],
+}])
+
+grader = te.AgentGrader(model="mimo-v2.5-pro", api_key="...", base_url="...")
+results = te.Evaluation.run(ds, grader, env=env, model="mimo-v2.5-pro", api_key="...", base_url="...")
 ```
 
-### RULER Zero-Config Reward
+### 3. Evaluate with Docker (agent runs in container)
 
 ```python
-# No reward function needed — LLM judge ranks trajectories
-grader = te.Grader.ruler(model="mimo-v2.5-pro")
+ds = te.Datasets.load_from_file("tasks.jsonl")
+grader = te.RubricGrader()
+
+env = te.Env.from_dict({
+    "system_prompt": "You are a support agent.",
+    "agent": {
+        "image": "python:3.12-slim",
+        "command": "python /app/agent.py",
+        "port": 8000,
+        "volumes": ["./my_agent:/app"],
+    },
+})
+
+results = te.Evaluation.run(ds, env, grader, agent_port=8000)
 ```
 
-### Weighted Multi-Grader
+### 4. Evaluate with agent endpoint (no Docker)
 
 ```python
-# Combine multiple reward functions with weights
-def correctness(state, **kwargs) -> float:
-    ...
+ds = te.Datasets.load_from_file("tasks.jsonl")
+grader = te.RubricGrader()
 
-def completeness(state, **kwargs) -> float:
-    ...
-
-grader = te.Grader(funcs=[correctness, completeness], weights=[0.7, 0.3])
+results = te.Evaluation.run(ds, grader, agent_port=8000)
 ```
 
-### Docker Sandbox
+### 5. RULER zero-config (no rubrics needed)
 
 ```python
-# Run evaluation in isolated Docker containers
-env = te.DockerSandboxEnv(
-    image="python:3.12-slim",
-    rubric=my_rubric,
-    system_prompt="You are a coding agent.",
-)
+ds = te.Datasets.load_from_dict([
+    {"query": "Explain quantum computing"},
+    {"query": "Write a haiku about programming"},
+])
+
+grader = te.RulerGrader(model="mimo-v2.5-pro", api_key="...", base_url="...")
+results = te.Evaluation.run(ds, grader, env=env, model="mimo-v2.5-pro", api_key="...", base_url="...")
 ```
 
-### Multi-Turn Tool Calling
+### 6. Save and load results
 
 ```python
-# Agent can call Python functions as tools
-def search_database(query: str) -> str:
-    '''Search the database for matching records.'''
-    return db.search(query)
-
-env = te.MultiTurnToolEnv(
-    tools=[search_database],
-    rubric=my_rubric,
-    max_turns=10,
-)
+results.save("results.json")
+loaded = te.EvaluationResult.load("results.json")
+print(loaded.summary())
 ```
 
-### MCP Tool Integration
+## Docker Compose
 
 ```python
-# Connect to existing MCP servers
+compose = te.DockerCompose(services={
+    "agent": {
+        "image": "my-agent:latest",
+        "port": 8000,
+        "env": {"OPENAI_API_KEY": "sk-..."},
+        "volumes": ["./code:/app"],
+    },
+    "mcp-server": {
+        "image": "my-mcp:latest",
+        "port": 9000,
+    },
+})
+
+ports = await compose.up()
+# agent at localhost:8000, mcp at localhost:9000
+await compose.down()
+```
+
+## MCP Integration
+
+```python
 server = te.MCPServer(url="http://localhost:9000/mcp", name="my-tools")
 registry = te.MCPToolRegistry()
 registry.add_server("cx_app", server)
 ```
 
-### GRPO Training
+## Built-in Environments
 
 ```python
-# Train with Group Relative Policy Optimization
-trainer = te.Training.run(
-    datasets=datasets,
-    base_model="Qwen/Qwen3-8B",
-    algorithm="grpo",
-    rollouts_per_example=8,
-)
+# Load from HuggingFace
+ds = te.Datasets.from_huggingface("gsm8k", split="test", n=10)
+
+# Load from dict
+ds = te.Datasets.load_from_dict([{"query": "...", "reference_answer": "..."}])
+
+# Load from file
+ds = te.Datasets.load_from_file("tasks.jsonl")
 ```
 
-### SFT/DPO Export
+## Test Results
+
+### Math Evaluation (Mimo v2.5 Pro)
+```
+Q01: 12 * 15?                    -> 180      [PASS]
+Q02: 24 + 36?                    -> 60       [PASS]
+Q03: 100 / 4?                    -> 25       [PASS]
+Q04: 7 * 8?                      -> 56       [PASS]
+Q05: 15% of 200?                 -> 30       [PASS]
+Avg Reward: 1.0 | Pass Rate: 100%
+```
+
+### Customer Support (21 scenarios, AgentGrader)
+```
+Billing:       75% pass
+Security:      100% pass
+Policy:        100% pass
+Account:       67% pass
+Technical:     25% pass
+Avg Reward: 0.74 | Pass Rate: 57%
+```
+
+### Voice Pipeline (TTS -> ASR -> LLM)
+```
+Q1: "What is 12 * 15?" -> Audio -> Transcribe -> "180" [PASS]
+Q2: "3 items at $25"    -> Audio -> Transcribe -> "75"  [PASS]
+Q3: "15% of 200"       -> Audio -> Transcribe -> "30"  [PASS]
+Avg Reward: 1.0 | Pass Rate: 100%
+```
+
+### Docker Compose
+```
+Container started on port 8002
+Agent ready
+Q1: What is 2+2? -> 4 [PASS]
+Q2: What is 12*15? -> 180 [PASS]
+Q3: What is 10*5? -> 50 [PASS]
+Q4: What is 100/4? -> 25 [PASS]
+Avg Reward: 1.0 | Pass Rate: 100%
+```
+
+## API Reference
+
+### Core Classes
+
+| Class | Purpose |
+|-------|---------|
+| `te.Env` | Environment config + Docker lifecycle |
+| `te.Datasets` | Load datasets from file/dict/HuggingFace |
+| `te.RubricGrader` | Rule-based scoring |
+| `te.AgentGrader` | LLM-as-judge scoring |
+| `te.RulerGrader` | Zero-config relative ranking |
+| `te.Evaluation` | Run evaluations |
+| `te.EvaluationResult` | Results with summary/save/load |
+| `te.DockerCompose` | Docker compose manager |
+| `te.MCPServer` | MCP server client |
+
+### Evaluation.run() Signature
 
 ```python
-# Export evaluation results as training data
-exporter = te.TrainingDataExporter()
-sft_data = exporter.export_sft(results.runs, teacher_model="mimo-v2.5-pro")
-exporter.save_jsonl(sft_data, "training_data.jsonl")
+te.Evaluation.run(
+    datasets: Datasets,           # Test cases
+    env: Env = None,              # Environment config
+    grader: Grader = None,        # Scorer (default: RubricGrader)
+    model: str = "mimo-v2.5-pro", # Model name
+    api_key: str = None,          # API key
+    base_url: str = None,         # API base URL
+    workers: int = 4,             # Concurrent workers
+    agent_port: int = None,       # Agent endpoint port
+    mcp_port: int = None,         # MCP server port
+    system_prompt: str = None,    # System prompt (overrides env)
+    output: str = None,           # Save results to file
+) -> EvaluationResult
 ```
 
-### Deploy
-
-```python
-# Deploy trained model as OpenAI-compatible endpoint
-endpoint = trainer.deploy(name="my-agent-v3", provider="together")
-print(endpoint.model_id)  # "tensoreval/my-agent-v3"
-print(endpoint.base_url)  # "https://api.together.xyz/v1"
-```
-
-## Architecture
+## Repository Structure
 
 ```
-tensoreval/
-├── core/           # Types, errors, decorators (from Verifiers)
-├── parsers/        # Answer extraction (from Verifiers)
-├── rubrics/        # Scoring system (Verifiers + ART RULER)
-├── envs/           # Environment classes (Verifiers + HUD)
-├── training/       # GRPO, SFT/DPO export (verl + Tinker patterns)
-├── deploy/         # Model deployment (ART pattern)
-├── cli/            # CLI commands (HUD pattern)
-├── datasets.py     # Dataset loading
-├── evaluation.py   # Evaluation runner
-├── grader.py       # Grader with RULER fallback
-├── environments.py # Built-in environments
-├── auto_generate.py # Auto-generate tests from description
-├── verified_evaluator.py # Tool-verified scoring
-├── mcp_tools.py    # MCP server integration
-└── verifiers_integration.py # Load Verifiers environments
+tensoreval-sdk/
+├── tensoreval/              # SDK source
+│   ├── __init__.py
+│   ├── env.py               # Env config + Docker lifecycle
+│   ├── datasets.py          # Dataset loading
+│   ├── evaluation.py        # Evaluation runner
+│   ├── docker_compose.py    # Docker compose manager
+│   ├── enums.py             # EnvType, Modality, GraderType
+│   ├── mcp_tools.py         # MCP server/client
+│   ├── graders/             # RubricGrader, AgentGrader, RulerGrader
+│   ├── voice/               # Voice metrics
+│   └── utils/               # Helpers
+├── tests/                   # Unit tests (11 passing)
+├── examples/
+│   ├── scripts/             # Test scripts
+│   ├── scenarios/           # Test scenarios
+│   ├── results/             # Test results
+│   └── user_agent/          # Example user agent with Docker
+├── INTEGRATION.md           # How to use in your repo
+├── REPORT.md                # Customer support evaluation report
+└── README.md                # This file
 ```
-
-## Comparison with Other SDKs
-
-| Feature | TensorEval | Verifiers | Inspect AI | ART | HUD |
-|---------|-----------|-----------|------------|-----|-----|
-| Auto-generated tests | **YES** | No | No | No | No |
-| Verified evaluation | **YES** | No | No | No | No |
-| RULER zero-config | **YES** | No | No | YES | No |
-| Weighted multi-grader | **YES** | YES | No | No | No |
-| GRPO training | **YES** | YES | No | YES | YES |
-| Deploy endpoint | **YES** | No | No | YES | No |
-| CLI | **YES** | YES | YES | YES | YES |
-| MCP tools | **YES** | YES | YES | No | YES |
-| Docker sandbox | **YES** | YES | YES | No | YES |
-| Built-in envs | **6** | 30+ | 100+ | 0 | 14 presets |
-| Lines of code | **6,800** | 35,000 | 80,000 | 103,000 | 50,000 |
-| Install size | **~20 MB** | ~80 MB | ~150 MB | ~500 MB | ~50 MB |
-
-## Dependencies
-
-```toml
-[project]
-dependencies = [
-    "pydantic>=2.0",
-    "openai>=1.0",
-    "rich>=13.0",
-    "typer>=0.12",
-    "httpx>=0.27",
-    "tqdm>=4.0",
-    "tenacity>=8.0",
-]
-
-[project.optional-dependencies]
-anthropic = ["anthropic>=0.30"]
-litellm = ["litellm>=1.0"]
-datasets = ["datasets>=2.0"]
-tinker = ["tinker>=0.22.0"]
-verifiers = ["verifiers>=0.1.14"]
-```
-
-## License
-
-MIT
 
 ## Links
 
-- [GitHub](https://github.com/krissint/tensoreval-sdk)
-- [Documentation](https://github.com/krissint/tensoreval-sdk#readme)
+- **GitHub:** https://github.com/TensorEval/tensoreval-sdk
+- **Integration Guide:** [INTEGRATION.md](INTEGRATION.md)
+- **Evaluation Report:** [examples/REPORT.md](examples/REPORT.md)
