@@ -3,15 +3,17 @@
 Allows environments to expose tools via MCP servers.
 """
 
+from __future__ import annotations
+
 import asyncio
 import json
-from typing import Any, Callable
+from typing import Any
 
 
 class MCPTool:
     """Represents a tool exposed by an MCP server."""
 
-    def __init__(self, name: str, description: str, parameters: dict[str, Any], server: "MCPServer"):
+    def __init__(self, name: str, description: str, parameters: dict[str, Any], server: MCPServer):
         self.name = name
         self.description = description
         self.parameters = parameters
@@ -122,13 +124,12 @@ class MCPToolRegistry:
         registry = MCPToolRegistry()
         registry.add_server("cx_app", MCPServer(url="http://localhost:9000/mcp"))
         tools = await registry.list_all_tools()
-        result = await registry.call_tool("cx_app", "lookup_order", {"order_id": "O7841"})
     """
 
     def __init__(self):
         self.servers: dict[str, MCPServer] = {}
 
-    def add_server(self, name: str, server: MCPServer):
+    def add_server(self, name: str, server: MCPServer) -> None:
         """Add an MCP server to the registry."""
         self.servers[name] = server
 

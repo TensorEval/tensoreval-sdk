@@ -3,7 +3,17 @@ services:
     image: python:3.12-slim
     command: python /app/agent.py
     ports:
-      - "127.0.0.1:8005:8000"
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - .:/app
+    init: true
+    stop_grace_period: 1s
+
+  mcp:
+    image: python:3.12-slim
+    command: python /app/mcp_server.py
+    ports:
+      - "127.0.0.1:9000:9000"
     volumes:
       - .:/app
     init: true

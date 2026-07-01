@@ -1,216 +1,317 @@
 """Evaluation runner for TensorEval.
 
-Usage:
-    env = te.Env.load_from_file("config.yaml")
-    ds = te.Datasets.load_from_dict([...])
-    grader = te.RubricGrader()
-    results = te.Evaluation.run(ds, env, grader, workers=4, agent_port=8000, mcp_port=9000)
+Core API:
+    results = Evaluation.run(dataset, grader, agent=my_agent, model="gpt-4o")
+    print(results.summary())
+    results.save("results.json")
+
+Agent can be:
+    - An Agent instance (any class extending Agent)
+    - An async function (async def my_agent(query) -> str)
+    - A string URL ("http://localhost:8000")
+    - A model name ("gpt-4o" with api_key)
 """
+
+from __future__ import annotations
 
 import asyncio
 import json
 import os
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Awaitable
 
-from tensoreval.graders.base import Grader
 from tensoreval.datasets import Datasets
+from tensoreval.graders.base import Grader
+from tensoreval.types import EvalConfig, Run, Score, Summary
 
 
 class EvaluationResult:
     """Results from an evaluation run."""
 
-    def __init__(self, runs: list[dict], datasets: Datasets, model: str):
+    def __init__(self, runs: list[Run], datasets: Datasets, config: EvalConfig):
         self.runs = runs
         self.datasets = datasets
-        self.model = model
+        self.config = config
 
     @property
     def pass_rate(self) -> float:
         if not self.runs:
             return 0.0
-        return sum(1 for r in self.runs if r.get("reward", 0) >= 0.8) / len(self.runs)
+        return sum(1 for r in self.runs if r.reward >= self.config.pass_threshold) / len(self.runs)
 
     @property
     def avg_reward(self) -> float:
         if not self.runs:
             return 0.0
-        return sum(r.get("reward", 0) for r in self.runs) / len(self.runs)
+        return sum(r.reward for r in self.runs) / len(self.runs)
 
-    def summary(self) -> dict[str, Any]:
-        return {
-            "model": self.model,
-            "num_runs": len(self.runs),
-            "avg_reward": round(self.avg_reward, 4),
-            "pass_rate": round(self.pass_rate, 4),
-            "pass_count": sum(1 for r in self.runs if r.get("reward", 0) >= 0.8),
-            "fail_count": sum(1 for r in self.runs if r.get("reward", 0) < 0.8),
-        }
+    @property
+    def avg_latency_ms(self) -> float:
+        if not self.runs:
+            return 0.0
+        return sum(r.latency_ms for r in self.runs) / len(self.runs)
+
+    def summary(self) -> Summary:
+        """Get aggregate summary."""
+        return Summary(
+            model=self.config.model,
+            num_runs=len(self.runs),
+            avg_reward=self.avg_reward,
+            pass_rate=self.pass_rate,
+            pass_count=sum(1 for r in self.runs if r.reward >= self.config.pass_threshold),
+            fail_count=sum(1 for r in self.runs if r.reward < self.config.pass_threshold),
+            total_latency_ms=self.avg_latency_ms,
+        )
 
     def per_query(self) -> list[dict[str, Any]]:
-        results = []
-        for i, run in enumerate(self.runs):
-            sample = self.datasets[i] if i < len(self.datasets) else None
-            results.append({
-                "query_id": sample.id if sample else f"q_{i+1}",
-                "query": sample.input if sample else "",
-                "reward": run.get("reward", 0),
-                "passed": run.get("reward", 0) >= 0.8,
-                "response": run.get("response", ""),
-            })
-        return results
+        """Get per-query details."""
+        return [
+            {
+                "query_id": r.sample_id,
+                "query": r.query,
+                "reward": r.reward,
+                "passed": r.reward >= self.config.pass_threshold,
+                "response": r.response,
+                "latency_ms": r.latency_ms,
+            }
+            for r in self.runs
+        ]
 
-    def save(self, path: str | Path):
+    def save(self, path: str | Path) -> None:
+        """Save results to JSON."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+
         data = {
-            "model": self.model,
-            "summary": self.summary(),
-            "runs": self.runs,
+            "config": {
+                "model": self.config.model,
+                "pass_threshold": self.config.pass_threshold,
+                "workers": self.config.workers,
+            },
+            "summary": self.summary().to_dict(),
+            "runs": [
+                {
+                    "sample_id": r.sample_id,
+                    "query": r.query,
+                    "answer": r.answer,
+                    "response": r.response,
+                    "reward": r.reward,
+                    "latency_ms": r.latency_ms,
+                    "error": r.error,
+                }
+                for r in self.runs
+            ],
             "datasets": [
                 {
                     "input": s.input,
                     "target": s.target,
-                    "rubrics": s.rubrics if hasattr(s, "rubrics") else [],
+                    "rubrics": [{"name": r.name, "criteria": r.criteria, "weight": r.weight} for r in s.rubrics],
                 }
                 for s in self.datasets
             ],
         }
+
         with open(path, "w") as f:
             json.dump(data, f, indent=2, default=str)
 
     @classmethod
-    def load(cls, path: str | Path) -> "EvaluationResult":
+    def load(cls, path: str | Path) -> EvaluationResult:
+        """Load results from JSON."""
         path = Path(path)
+        if not path.exists():
+            raise FileNotFoundError(f"Results file not found: {path}")
+
         with open(path) as f:
             data = json.load(f)
-        from tensoreval.datasets import Sample
+
+        from tensoreval.types import Rubric, Sample
         samples = [
-            Sample(input=s["input"], target=s.get("target", ""), rubrics=s.get("rubrics", []))
+            Sample(
+                input=s["input"],
+                target=s.get("target", ""),
+                rubrics=[Rubric.from_dict(r) for r in s.get("rubrics", [])],
+            )
             for s in data.get("datasets", [])
         ]
-        return cls(runs=data.get("runs", []), datasets=Datasets(samples), model=data.get("model", "unknown"))
+
+        config_data = data.get("config", {})
+        config = EvalConfig(
+            model=config_data.get("model", "unknown"),
+            pass_threshold=config_data.get("pass_threshold", 0.8),
+        )
+
+        runs = [
+            Run(
+                sample_id=r.get("sample_id", ""),
+                query=r.get("query", ""),
+                answer=r.get("answer", ""),
+                response=r.get("response", ""),
+                reward=r.get("reward", 0.0),
+                latency_ms=r.get("latency_ms", 0.0),
+                error=r.get("error"),
+            )
+            for r in data.get("runs", [])
+        ]
+
+        return cls(runs=runs, datasets=Datasets(samples), config=config)
 
 
 class Evaluation:
     """Evaluation runner.
 
     Usage:
-        env = te.Env.load_from_file("config.yaml")
-        ds = te.Datasets.load_from_dict([...])
-        grader = te.RubricGrader()
-        results = te.Evaluation.run(ds, env, grader, workers=4, agent_port=8000, mcp_port=9000)
+        # With a function
+        async def my_agent(query: str) -> str:
+            return "answer"
+
+        results = Evaluation.run(dataset, grader, agent=my_agent)
+
+        # With an Agent class
+        class MyAgent(Agent):
+            async def run(self, query, context):
+                return "answer"
+
+        results = Evaluation.run(dataset, grader, agent=MyAgent())
+
+        # With an endpoint
+        results = Evaluation.run(dataset, grader, agent="http://localhost:8000")
+
+        # With a model name
+        results = Evaluation.run(dataset, grader, agent="gpt-4o", api_key="sk-...")
     """
 
     @staticmethod
     async def run_async(
-        datasets: Datasets,
-        env: Any = None,
+        dataset: Datasets,
         grader: Grader | None = None,
-        model: str = "mimo-v2.5-pro",
-        api_key: str | None = None,
-        base_url: str | None = None,
-        workers: int = 4,
-        agent_port: int | None = None,
-        mcp_port: int | None = None,
-        system_prompt: str | None = None,
-        output: str | None = None,
+        agent: Any = None,
+        env: Any = None,
+        config: EvalConfig | None = None,
+        **kwargs: Any,
     ) -> EvaluationResult:
-        """Run evaluation.
+        """Run evaluation asynchronously.
 
         Args:
-            datasets: Samples with queries, answers, rubrics.
-            env: Env config (system_prompt, agent_url, mcp_url, Docker config).
+            dataset: Samples with queries, answers, rubrics.
             grader: Scorer (default: RubricGrader).
-            model: Model name.
-            api_key: API key.
-            base_url: Base URL.
-            workers: Concurrent workers.
-            agent_port: Port for agent endpoint (overrides env).
-            mcp_port: Port for MCP server (overrides env).
-            system_prompt: System prompt (overrides env).
-            output: Save results to this path.
-        """
-        # Wire env config
-        if env is not None:
-            if system_prompt is None:
-                system_prompt = env.system_prompt
-            if agent_port is None and env.agent_url:
-                try:
-                    agent_port = int(env.agent_url.rsplit(":", 1)[-1])
-                except ValueError:
-                    pass
-            if mcp_port is None and env.mcp_url:
-                try:
-                    mcp_port = int(env.mcp_url.rsplit(":", 1)[-1])
-                except ValueError:
-                    pass
+            agent: Agent to evaluate. Can be:
+                - Agent instance
+                - async function (query: str) -> str
+                - String URL ("http://localhost:8000")
+                - Model name ("gpt-4o")
+            env: Env config (system_prompt, Docker config).
+            config: Evaluation configuration.
+            **kwargs: Override config fields (model, api_key, base_url, etc.)
 
+        Returns:
+            EvaluationResult with per-query scores and summary.
+        """
+        from tensoreval.agents import Agent, Context, resolve_agent
+
+        # Build config
+        if config is None:
+            config = EvalConfig(**{k: v for k, v in kwargs.items() if k in EvalConfig.__dataclass_fields__})
+        else:
+            for k, v in kwargs.items():
+                if hasattr(config, k):
+                    setattr(config, k, v)
+
+        # Resolve env config
+        if env is not None:
+            if config.system_prompt is None:
+                config.system_prompt = env.system_prompt
+
+        # Resolve agent
+        resolved_agent = resolve_agent(
+            agent=agent,
+            model=config.model,
+            api_key=config.api_key or os.environ.get("TENSOREVAL_API_KEY", os.environ.get("OPENAI_API_KEY", "")),
+            base_url=config.base_url or os.environ.get("TENSOREVAL_BASE_URL", ""),
+            agent_port=config.agent_port,
+        )
+
+        # Default grader
         if grader is None:
             from tensoreval.graders.rubric_grader import RubricGrader
             grader = RubricGrader()
 
-        resolved_key = api_key or os.environ.get("TENSOREVAL_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
-        resolved_url = base_url or os.environ.get("TENSOREVAL_BASE_URL", "https://api.openai.com/v1")
+        # Resolve API key
+        if not config.api_key:
+            config.api_key = os.environ.get("TENSOREVAL_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
+        if not config.base_url:
+            config.base_url = os.environ.get("TENSOREVAL_BASE_URL", "https://api.openai.com/v1")
 
-        # Build inputs
-        inputs = []
-        for i, sample in enumerate(datasets):
-            inputs.append({
-                "query": sample.input,
-                "answer": sample.target if isinstance(sample.target, str) else str(sample.target),
-                "rubrics": sample.rubrics if hasattr(sample, "rubrics") else [],
-                "info": sample.metadata if hasattr(sample, "metadata") and sample.metadata else {},
-                "index": i,
-            })
+        from tensoreval.observability import current_run, get_tracer
 
-        # Run evaluations
-        sem = asyncio.Semaphore(workers)
+        tracer = get_tracer()
+        trace_run = None
+        if current_run() is None:
+            trace_run = tracer.begin_run(
+                "evaluation",
+                model=config.model,
+                samples=len(dataset),
+                workers=config.workers,
+            )
 
-        async def eval_one(inp: dict) -> dict:
-            async with sem:
-                return await _evaluate_single(
-                    inp, grader, model, resolved_key, resolved_url,
-                    agent_port, mcp_port, system_prompt,
-                )
+        # Start Docker if needed
+        env_started = False
+        if env is not None and hasattr(env, 'start') and hasattr(env, 'agent') and env.agent:
+            try:
+                await env.start()
+                env_started = True
+            except Exception:
+                pass
 
-        tasks = [eval_one(inp) for inp in inputs]
-        runs = await asyncio.gather(*tasks)
-
-        result = EvaluationResult(list(runs), datasets, model)
-
-        if output:
-            result.save(output)
-
-        return result
+        try:
+            results = await _run_eval(dataset, grader, resolved_agent, config)
+            if trace_run is not None:
+                trace_run.set_summary(status="ok", **results.summary().to_dict())
+            return results
+        except Exception as e:
+            if trace_run is not None:
+                trace_run.set_summary(status="error", error=str(e))
+            raise
+        finally:
+            if env_started and hasattr(env, 'stop'):
+                try:
+                    await env.stop()
+                except Exception:
+                    pass
+            if trace_run is not None:
+                tracer.end_run(trace_run)
 
     @staticmethod
     def run(
-        datasets: Datasets,
-        env: Any = None,
+        dataset: Datasets,
         grader: Grader | None = None,
-        model: str = "mimo-v2.5-pro",
-        api_key: str | None = None,
-        base_url: str | None = None,
-        workers: int = 4,
-        agent_port: int | None = None,
-        mcp_port: int | None = None,
-        system_prompt: str | None = None,
-        output: str | None = None,
+        agent: Any = None,
+        env: Any = None,
+        config: EvalConfig | None = None,
+        **kwargs: Any,
     ) -> EvaluationResult:
-        """Run evaluation synchronously."""
+        """Run evaluation synchronously.
+
+        Args:
+            dataset: Samples with queries, answers, rubrics.
+            grader: Scorer (default: RubricGrader).
+            agent: Agent to evaluate (see run_async for options).
+            env: Env config.
+            config: Evaluation configuration.
+            **kwargs: Override config fields.
+
+        Returns:
+            EvaluationResult with per-query scores and summary.
+        """
+        coro = Evaluation.run_async(
+            dataset=dataset, grader=grader, agent=agent,
+            env=env, config=config, **kwargs,
+        )
+
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
-
-        coro = Evaluation.run_async(
-            datasets=datasets, env=env, grader=grader, model=model,
-            api_key=api_key, base_url=base_url, workers=workers,
-            agent_port=agent_port, mcp_port=mcp_port,
-            system_prompt=system_prompt, output=output,
-        )
 
         if loop is not None:
             import nest_asyncio
@@ -219,67 +320,91 @@ class Evaluation:
         return asyncio.run(coro)
 
 
-async def _evaluate_single(inp, grader, model, api_key, base_url, agent_port, mcp_port, system_prompt):
-    query = inp["query"]
-    answer = inp["answer"]
+async def _run_eval(
+    dataset: Datasets,
+    grader: Grader,
+    agent: Any,  # Agent instance
+    config: EvalConfig,
+) -> EvaluationResult:
+    """Internal: run the evaluation loop."""
+    from tensoreval.agents import Context
 
-    if agent_port:
-        response = await _call_agent(query, agent_port, system_prompt)
-    else:
-        response = await _call_model(query, model, api_key, base_url, system_prompt)
+    sem = asyncio.Semaphore(config.workers)
 
-    state = {
-        "prompt": [{"role": "user", "content": query}],
-        "completion": [{"role": "assistant", "content": response}],
-        "answer": answer,
-        "info": {**inp.get("info", {}), "rubrics": inp.get("rubrics", [])},
-    }
+    async def eval_one(idx: int) -> Run:
+        async with sem:
+            return await _evaluate_single(idx, dataset, grader, agent, config)
 
-    reward = await grader.score(state)
+    tasks = [eval_one(i) for i in range(len(dataset))]
+    runs = await asyncio.gather(*tasks)
 
-    return {
-        "query_id": f"q_{inp['index'] + 1}",
-        "query": query,
-        "answer": answer,
-        "response": response,
-        "reward": reward,
-        "completion": state["completion"],
-    }
+    return EvaluationResult(list(runs), dataset, config)
 
 
-async def _call_model(query, model, api_key, base_url, system_prompt):
-    is_anthropic = base_url and "anthropic" in base_url.lower()
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": query})
+async def _evaluate_single(
+    idx: int,
+    dataset: Datasets,
+    grader: Grader,
+    agent: Any,
+    config: EvalConfig,
+) -> Run:
+    """Internal: evaluate a single sample."""
+    from tensoreval.agents import Context
 
-    if is_anthropic:
-        import anthropic
-        client = anthropic.AsyncAnthropic(api_key=api_key, base_url=base_url)
-        response = await client.messages.create(model=model, max_tokens=2000, messages=messages)
-        for block in response.content:
-            if hasattr(block, "text"):
-                return block.text
-        return ""
-    else:
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-        response = await client.chat.completions.create(model=model, max_tokens=2000, messages=messages)
-        return response.choices[0].message.content or ""
+    sample = dataset[idx]
+    start_time = time.monotonic()
 
-
-async def _call_agent(query, agent_port, system_prompt):
-    import httpx
-    messages = []
-    if system_prompt:
-        messages.append({"role": "system", "content": system_prompt})
-    messages.append({"role": "user", "content": query})
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"http://localhost:{agent_port}/v1/chat/completions",
-            json={"messages": messages},
-            timeout=120.0,
+    try:
+        # Build context
+        context = Context(
+            query=sample.input,
+            system_prompt=config.system_prompt,
+            metadata={"sample_id": sample.id, "index": idx},
         )
-        data = response.json()
-        return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+        from tensoreval.observability import observe
+
+        @observe("agent.run", kind="agent")
+        async def call_agent(input_text: str, model: str) -> str:
+            return await agent.run(input_text, context)
+
+        @observe("grader.score", kind="grader")
+        async def call_grader(input_text: str, model: str, state: dict[str, Any]) -> float:
+            return await grader.score(state)
+
+        # Get response from agent
+        response = await call_agent(input_text=sample.input, model=config.model)
+        latency_ms = (time.monotonic() - start_time) * 1000
+
+        # Build state for grader
+        state = {
+            "query": sample.input,
+            "answer": sample.target,
+            "completion": [{"role": "assistant", "content": response}],
+            "info": {"rubrics": [{"name": r.name, "criteria": r.criteria, "weight": r.weight} for r in sample.rubrics]},
+            "prompt": [{"role": "user", "content": sample.input}],
+            "index": idx,
+        }
+
+        reward = await call_grader(input_text=response, model=config.model, state=state)
+
+        return Run(
+            sample_id=sample.id,
+            query=sample.input,
+            answer=sample.target,
+            response=response,
+            reward=reward,
+            latency_ms=latency_ms,
+        )
+
+    except Exception as e:
+        latency_ms = (time.monotonic() - start_time) * 1000
+        return Run(
+            sample_id=sample.id,
+            query=sample.input,
+            answer=sample.target,
+            response="",
+            reward=0.0,
+            latency_ms=latency_ms,
+            error=str(e),
+        )

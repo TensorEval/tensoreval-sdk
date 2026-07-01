@@ -14,6 +14,7 @@ Usage:
     results = te.Evaluation.run(ds, grader, env=env)
 """
 
+import asyncio
 import json
 import re
 from typing import Any
@@ -36,7 +37,7 @@ For EACH rubric, assign a score from 0.0 to 1.0:
 - 0.0 = does not satisfy
 
 Output ONLY a JSON object:
-{{"scores": [{{"name": "<rubric_name>", "score": <0.0-1.0>, "reason": "<brief>}}]}}"""
+{{"scores": [{{"name": "<rubric_name>", "score": <0.0-1.0>, "reason": "<brief>"}}]}}"""
 
 
 class AgentGrader(Grader):
@@ -49,6 +50,8 @@ class AgentGrader(Grader):
         model: Model name (e.g., "mimo-v2.5-pro").
         api_key: API key.
         base_url: API base URL.
+        fallback_on_error: If True, falls back to substring matching on errors.
+            If False, raises the error. Default: False (fail loudly).
     """
 
     def __init__(
@@ -56,24 +59,27 @@ class AgentGrader(Grader):
         model: str = "mimo-v2.5-pro",
         api_key: str | None = None,
         base_url: str | None = None,
+        fallback_on_error: bool = False,
     ):
         super().__init__(GraderType.AGENT)
         self.model = model
         self.api_key = api_key
         self.base_url = base_url
+        self.fallback_on_error = fallback_on_error
 
     async def score(self, state: dict, **kwargs) -> float:
         """Score response using LLM judge against rubrics."""
         completion = state.get("completion", [])
         answer = state.get("answer", "")
         rubrics = state.get("info", {}).get("rubrics", [])
-        query = ""
+        query = state.get("query", "")
 
-        # Extract query
-        prompt = state.get("prompt", [])
-        if isinstance(prompt, list) and prompt:
-            last = prompt[-1]
-            query = last.get("content", "") if isinstance(last, dict) else str(last)
+        # Extract query from prompt if not in state
+        if not query:
+            prompt = state.get("prompt", [])
+            if isinstance(prompt, list) and prompt:
+                last = prompt[-1]
+                query = last.get("content", "") if isinstance(last, dict) else str(last)
 
         if not completion:
             return 0.0
@@ -87,7 +93,7 @@ class AgentGrader(Grader):
 
         # Build rubrics text for judge
         rubrics_text = "\n".join(
-            f"{i+1}. {r.get('name', 'rubric')}: {r.get('criteria', r.get('rubric', ''))}"
+            f"{i+1}. {r.get('name', 'rubric')}: {r.get('criteria', r.get('rubric', ''))} (weight: {r.get('weight', 1.0/len(rubrics))})"
             for i, r in enumerate(rubrics)
         )
 
@@ -108,8 +114,9 @@ class AgentGrader(Grader):
                 total += score_data.get("score", 0.0) * weight
             return min(max(total, 0.0), 1.0)
         except Exception as e:
-            # Fallback: simple answer match
-            return 1.0 if answer and answer.lower() in response.lower() else 0.0
+            if self.fallback_on_error:
+                return 1.0 if answer and answer.lower() in response.lower() else 0.0
+            raise RuntimeError(f"AgentGrader judge call failed: {e}") from e
 
     async def _call_judge(self, prompt: str) -> list[dict]:
         """Call the LLM judge and parse scores."""
@@ -124,15 +131,18 @@ class AgentGrader(Grader):
         return self._parse_scores(content)
 
     async def _call_anthropic(self, prompt: str) -> str:
-        """Call Anthropic-compatible API (Mimo uses this)."""
+        """Call Anthropic-compatible API with correct system message handling."""
         import anthropic
         client = anthropic.AsyncAnthropic(api_key=self.api_key, base_url=self.base_url)
-        response = await client.messages.create(
-            model=self.model,
-            max_tokens=2000,
-            messages=[{"role": "user", "content": prompt}],
+        response = await asyncio.wait_for(
+            client.messages.create(
+                model=self.model,
+                max_tokens=2000,
+                system="You are an evaluation judge. Output only valid JSON.",
+                messages=[{"role": "user", "content": prompt}],
+            ),
+            timeout=60.0,
         )
-        # Mimo returns ThinkingBlock + TextBlock — find the text block
         for block in response.content:
             if hasattr(block, "text"):
                 return block.text
@@ -142,21 +152,33 @@ class AgentGrader(Grader):
         """Call OpenAI-compatible API."""
         from openai import AsyncOpenAI
         client = AsyncOpenAI(api_key=self.api_key or "dummy", base_url=self.base_url or "https://api.openai.com/v1")
-        response = await client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=500,
+        response = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are an evaluation judge. Output only valid JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=500,
+            ),
+            timeout=60.0,
         )
         return response.choices[0].message.content or ""
 
     def _parse_scores(self, content: str) -> list[dict]:
         """Parse LLM judge output into scores list."""
+        # Try direct JSON parse first
+        try:
+            data = json.loads(content.strip())
+            if "scores" in data:
+                return data["scores"]
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
         # Extract JSON from response
         try:
-            # Try to find JSON object
             match = re.search(r'\{[^{}]*"scores"[^{}]*\[.*?\].*?\}', content, re.DOTALL)
             if not match:
-                # Try broader search
                 match = re.search(r'\{.*"scores".*\}', content, re.DOTALL)
             if match:
                 data = json.loads(match.group())

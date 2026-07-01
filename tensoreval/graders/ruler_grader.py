@@ -7,7 +7,9 @@ Usage:
     grader = RulerGrader(model="gpt-4o-mini")
 """
 
+import asyncio
 import json
+import re
 from typing import Any
 from tensoreval.graders.base import Grader
 from tensoreval.enums import GraderType
@@ -42,8 +44,33 @@ class RulerGrader(Grader):
         self.rubric = rubric
 
     async def score(self, state: dict, **kwargs) -> float:
-        """Score a single response (not meaningful for RULER — use score_group)."""
-        return 0.5  # Placeholder — RULER only works on groups
+        """Score a single response — falls back to simple heuristics.
+
+        For proper relative ranking, use score_group() via Evaluation.run()
+        which detects RulerGrader automatically.
+        """
+        completion = state.get("completion", [])
+        answer = state.get("answer", "")
+
+        if not completion:
+            return 0.0
+
+        last = completion[-1]
+        response = last.get("content", "") if isinstance(last, dict) else str(getattr(last, "content", ""))
+
+        # Simple heuristic for single-sample scoring
+        if not response:
+            return 0.0
+
+        score = 0.5
+        # If there's a reference answer, check for match
+        if answer and answer.lower().strip() in response.lower().strip():
+            score = 0.8
+        # Longer, more detailed responses get slightly higher scores
+        word_count = len(response.split())
+        if word_count > 50:
+            score += 0.1
+        return min(score, 1.0)
 
     async def score_group(self, states: list[dict], **kwargs) -> list[float]:
         """Score a group using relative ranking."""
@@ -81,19 +108,17 @@ class RulerGrader(Grader):
         # Build trajectory XML
         trajectories = []
         for i, resp in enumerate(responses):
-            trajectories.append(f'<trajectory id="{i+1}">\n{resp}\n</trajectory>')
+            trajectories.append(f'<trajectory id="{i+1}">\n{resp[:1000]}\n</trajectory>')
 
         user_text = "Trajectories:\n\n" + "\n\n".join(trajectories)
 
         judge_prompt = f"""All of the trajectories below have been given the same goal. Your job is to consider each of them and give them a score between 0 and 1.
 
 Grading standards:
-{self.rubric}"""
+{self.rubric}
 
-        messages = [
-            {"role": "system", "content": judge_prompt},
-            {"role": "user", "content": user_text},
-        ]
+Output ONLY a JSON array of scores, one per trajectory, in order:
+[0.7, 0.3, 0.9]"""
 
         # Call LLM
         is_anthropic = self.base_url and "anthropic" in self.base_url.lower()
@@ -101,30 +126,49 @@ Grading standards:
         if is_anthropic:
             import anthropic
             client = anthropic.AsyncAnthropic(api_key=self.api_key, base_url=self.base_url)
-            response = await client.messages.create(
-                model=self.model,
-                max_tokens=1000,
-                messages=messages,
+            response = await asyncio.wait_for(
+                client.messages.create(
+                    model=self.model,
+                    max_tokens=1000,
+                    system="You are a trajectory judge. Output only a JSON array of scores.",
+                    messages=[{"role": "user", "content": user_text}],
+                ),
+                timeout=60.0,
             )
             content = response.content[0].text if response.content else "[]"
         else:
             from openai import AsyncOpenAI
             client = AsyncOpenAI(api_key=self.api_key or "dummy", base_url=self.base_url or "https://api.openai.com/v1")
-            response = await client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                max_tokens=1000,
+            response = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": "You are a trajectory judge. Output only a JSON array of scores."},
+                        {"role": "user", "content": user_text},
+                    ],
+                    max_tokens=1000,
+                ),
+                timeout=60.0,
             )
             content = response.choices[0].message.content or "[]"
 
-        # Parse scores
-        import re
+        # Parse scores — try JSON array first, then regex
         scores = []
-        score_pattern = re.findall(r'"?score"?\s*[:=]\s*(\d+\.?\d*)', content)
-        for s in score_pattern[:len(responses)]:
-            scores.append(max(0.0, min(1.0, float(s))))
+        try:
+            # Try to find JSON array
+            match = re.search(r'\[[\d\s,\.]+\]', content)
+            if match:
+                scores = json.loads(match.group())
+        except (json.JSONDecodeError, AttributeError):
+            pass
 
-        # Pad if needed
+        if not scores:
+            # Fallback: regex for individual scores
+            score_pattern = re.findall(r'"?score"?\s*[:=]\s*(\d+\.?\d*)', content)
+            scores = [float(s) for s in score_pattern[:len(responses)]]
+
+        # Clamp and pad
+        scores = [max(0.0, min(1.0, float(s))) for s in scores]
         while len(scores) < len(responses):
             scores.append(0.5)
 

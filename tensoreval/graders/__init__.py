@@ -1,9 +1,9 @@
 """Graders for TensorEval evaluation.
 
 Grader types:
-- RubricGrader: Rule-based scoring with weighted rubrics
-- AgentGrader: LLM-as-judge scoring
-- RulerGrader: Zero-config relative ranking via LLM
+- RubricGrader: LLM-judged rubric scoring (or simple matching)
+- AgentGrader: Multi-rubric LLM-as-judge
+- RulerGrader: Zero-config relative ranking
 """
 
 from tensoreval.graders.base import Grader
