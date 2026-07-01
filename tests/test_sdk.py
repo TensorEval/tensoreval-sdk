@@ -687,6 +687,98 @@ def test_mcp_tools():
 
 
 # ===========================================================================
+# 11. MCP TOOL CALLING + ENV WIRING
+# ===========================================================================
+
+def test_mcp_call_by_name():
+    """Test MCPToolRegistry.call_tool_by_name for unknown tools."""
+    import tensoreval as te
+
+    registry = te.MCPToolRegistry()
+    result = asyncio.run(registry.call_tool_by_name("nonexistent", {}))
+    assert "error" in result
+
+    server = te.MCPServer(url="http://localhost:9000/mcp")
+    registry.add_server("srv", server)
+    result = asyncio.run(registry.call_tool_by_name("missing_tool", {}))
+    assert "error" in result
+
+    print("  mcp_call_by_name: PASS")
+
+
+def test_env_docker_import_fixed():
+    """Verify Env Docker import points to tools.docker (not deleted docker_compose)."""
+    import tensoreval.tools.docker as docker_mod
+    assert hasattr(docker_mod, "DockerCompose")
+
+    try:
+        import tensoreval.docker_compose
+        assert False, "Old module should not exist"
+    except ImportError:
+        pass
+
+    print("  env_docker_import: PASS")
+
+
+def test_env_agent_url_port_extraction():
+    """Test that Env.agent_url port extraction works."""
+    import tensoreval as te
+
+    env = te.Env.from_dict({"agent_url": "http://localhost:8000"})
+    port = int(env.agent_url.rsplit(":", 1)[-1].split("/")[0])
+    assert port == 8000
+
+    env2 = te.Env.from_dict({"mcp_url": "http://localhost:9000/mcp"})
+    mcp_port = int(env2.mcp_url.rsplit(":", 1)[-1].split("/")[0])
+    assert mcp_port == 9000
+
+    print("  env_agent_url_port_extraction: PASS")
+
+
+def test_openai_agent_tool_loop_config():
+    """Test OpenAIAgent accepts max_tool_rounds parameter."""
+    import tensoreval as te
+
+    agent = te.OpenAIAgent(model="gpt-4o", api_key="sk-test", max_tool_rounds=5)
+    assert agent.max_tool_rounds == 5
+
+    agent2 = te.OpenAIAgent(model="gpt-4o", api_key="sk-test")
+    assert agent2.max_tool_rounds == 10
+
+    print("  openai_agent_tool_loop_config: PASS")
+
+
+def test_evaluation_mcp_tools_in_context():
+    """Test that MCP tools are wired into agent Context during evaluation."""
+    import tensoreval as te
+    from tensoreval.agents import Agent, Context
+    from tensoreval.evaluation import _evaluate_single
+
+    captured: dict = {}
+
+    class CaptureAgent(Agent):
+        async def run(self, query: str, context: Context) -> str:
+            captured["tools"] = context.tools
+            captured["has_registry"] = context.mcp_registry is not None
+            return "4"
+
+    ds = te.Datasets.load_from_dict([{"query": "2+2", "reference_answer": "4"}])
+    fake_tools = [{"type": "function", "function": {"name": "lookup", "parameters": {}}}]
+
+    asyncio.run(_evaluate_single(
+        0, ds, te.RubricGrader(simple=True), CaptureAgent(),
+        te.EvalConfig(model="test"),
+        mcp_tools=fake_tools,
+        mcp_registry="fake_registry",
+    ))
+
+    assert len(captured["tools"]) == 1
+    assert captured["has_registry"] is True
+
+    print("  evaluation_mcp_tools_in_context: PASS")
+
+
+# ===========================================================================
 # RUNNER
 # ===========================================================================
 
@@ -717,6 +809,11 @@ def run_all():
         test_indian_language_metrics,
         test_utils_parsing,
         test_mcp_tools,
+        test_mcp_call_by_name,
+        test_env_docker_import_fixed,
+        test_env_agent_url_port_extraction,
+        test_openai_agent_tool_loop_config,
+        test_evaluation_mcp_tools_in_context,
     ]
 
     passed = 0

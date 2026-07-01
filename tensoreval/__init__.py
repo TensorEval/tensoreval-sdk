@@ -65,6 +65,9 @@ from tensoreval.metrics.voice import VoiceMetrics, IndianLanguageMetrics, AudioM
 # Utilities
 from tensoreval.utils.data_utils import extract_boxed_answer, extract_hash_answer
 
+# Platform client (connect SDK to the TensorEval backend)
+from tensoreval.client import TensorEvalClient, TensorEvalError
+
 # Observability (opt-in tracing; LangSmith-style spans/runs/gaps)
 from tensoreval.observability import (
     ObservabilityTracer,
@@ -102,4 +105,6 @@ __all__ = [
     # Observability
     "ObservabilityTracer", "RunContext", "Span", "current_run", "current_span",
     "get_tracer", "set_tracer", "observe", "observe_run",
+    # Platform client
+    "TensorEvalClient", "TensorEvalError",
 ]

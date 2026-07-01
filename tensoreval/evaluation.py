@@ -221,6 +221,12 @@ class Evaluation:
         if env is not None:
             if config.system_prompt is None:
                 config.system_prompt = env.system_prompt
+            # Extract agent port from env.agent_url if not explicitly set
+            if config.agent_port is None and env.agent_url:
+                try:
+                    config.agent_port = int(env.agent_url.rsplit(":", 1)[-1].split("/")[0])
+                except (ValueError, IndexError):
+                    pass
 
         # Resolve agent
         resolved_agent = resolve_agent(
@@ -263,10 +269,25 @@ class Evaluation:
             except Exception:
                 pass
 
+        # Build MCP tool registry from env or config
+        mcp_registry = None
+        mcp_url = None
+        if env is not None and getattr(env, 'mcp_url', None):
+            mcp_url = env.mcp_url
+        elif config.mcp_port:
+            mcp_url = f"http://localhost:{config.mcp_port}/mcp"
+
+        if mcp_url:
+            from tensoreval.tools.mcp import MCPServer, MCPToolRegistry
+            mcp_registry = MCPToolRegistry()
+            mcp_registry.add_server("default", MCPServer(url=mcp_url))
+
         try:
-            results = await _run_eval(dataset, grader, resolved_agent, config)
+            results = await _run_eval(dataset, grader, resolved_agent, config, mcp_registry)
             if trace_run is not None:
                 trace_run.set_summary(status="ok", **results.summary().to_dict())
+            # Push to TensorEval backend if an API key is configured
+            _maybe_push_to_backend(results, trace_run)
             return results
         except Exception as e:
             if trace_run is not None:
@@ -325,15 +346,23 @@ async def _run_eval(
     grader: Grader,
     agent: Any,  # Agent instance
     config: EvalConfig,
+    mcp_registry: Any = None,
 ) -> EvaluationResult:
     """Internal: run the evaluation loop."""
-    from tensoreval.agents import Context
-
     sem = asyncio.Semaphore(config.workers)
+
+    # Pre-fetch MCP tools once (non-fatal if server is down)
+    mcp_tools: list[dict[str, Any]] = []
+    if mcp_registry:
+        try:
+            await mcp_registry.list_all_tools()
+            mcp_tools = mcp_registry.to_openai_tools()
+        except Exception:
+            pass  # MCP server down — eval continues without tools
 
     async def eval_one(idx: int) -> Run:
         async with sem:
-            return await _evaluate_single(idx, dataset, grader, agent, config)
+            return await _evaluate_single(idx, dataset, grader, agent, config, mcp_tools, mcp_registry)
 
     tasks = [eval_one(i) for i in range(len(dataset))]
     runs = await asyncio.gather(*tasks)
@@ -347,6 +376,8 @@ async def _evaluate_single(
     grader: Grader,
     agent: Any,
     config: EvalConfig,
+    mcp_tools: list[dict[str, Any]] | None = None,
+    mcp_registry: Any = None,
 ) -> Run:
     """Internal: evaluate a single sample."""
     from tensoreval.agents import Context
@@ -355,11 +386,13 @@ async def _evaluate_single(
     start_time = time.monotonic()
 
     try:
-        # Build context
+        # Build context — include MCP tools so agents can call them
         context = Context(
             query=sample.input,
             system_prompt=config.system_prompt,
+            tools=mcp_tools or [],
             metadata={"sample_id": sample.id, "index": idx},
+            mcp_registry=mcp_registry,
         )
 
         from tensoreval.observability import observe
@@ -408,3 +441,38 @@ async def _evaluate_single(
             latency_ms=latency_ms,
             error=str(e),
         )
+
+
+def _maybe_push_to_backend(results: EvaluationResult, trace_run: Any) -> None:
+    """Post results + traces to the TensorEval backend if TENSOREVAL_API_KEY is set.
+
+    Failures are non-fatal (printed to stderr) so local evals never break
+    because the backend is unreachable. Uses a short timeout (3s) so a down
+    backend doesn't stall the evaluation.
+    """
+    api_key = os.environ.get("TENSOREVAL_API_KEY")
+    if not api_key:
+        return
+
+    from tensoreval.client import TensorEvalClient, TensorEvalError
+
+    base_url = os.environ.get("TENSOREVAL_BASE_URL", "http://localhost:4000")
+    import sys
+
+    # Push eval results (short timeout — backend being down must not block)
+    try:
+        client = TensorEvalClient(api_key=api_key, base_url=base_url, timeout=3.0)
+        client.ingest_evaluation(results)
+    except TensorEvalError as e:
+        print(f"[tensoreval] backend push skipped: {e}", file=sys.stderr)
+    except Exception:
+        pass  # Backend down/unreachable — local evals must still work
+
+    # Push trace events if we have a run context with spans
+    if trace_run is not None and trace_run.spans:
+        events = [s.to_dict() for s in trace_run.spans]
+        try:
+            client = TensorEvalClient(api_key=api_key, base_url=base_url, timeout=3.0)
+            client.ingest_trace(trace_run.name, events)
+        except Exception:
+            pass  # Non-fatal

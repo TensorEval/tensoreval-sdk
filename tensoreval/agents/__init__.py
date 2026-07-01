@@ -33,6 +33,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Awaitable
@@ -53,6 +54,9 @@ class Context:
 
     tools: list[dict[str, Any]] = field(default_factory=list)
     """Available tools in OpenAI format."""
+
+    mcp_registry: Any = None
+    """MCPToolRegistry for executing tool calls (if tools came from MCP)."""
 
     metadata: dict[str, Any] = field(default_factory=dict)
     """Additional context (sample ID, rubrics, etc.)."""
@@ -107,6 +111,10 @@ class FunctionAgent(Agent):
 class OpenAIAgent(Agent):
     """Agent that calls an OpenAI-compatible API.
 
+    Supports a multi-turn tool-calling loop when MCP tools are provided in
+    the context. The agent calls the LLM, executes any tool calls via the
+    MCP registry, and repeats until the LLM stops requesting tools.
+
     Usage:
         agent = OpenAIAgent(
             model="gpt-4o",
@@ -121,11 +129,13 @@ class OpenAIAgent(Agent):
         api_key: str = "",
         base_url: str = "https://api.openai.com/v1",
         timeout: float = 60.0,
+        max_tool_rounds: int = 10,
     ):
         self.model = model
         self.api_key = api_key
         self.base_url = base_url
         self.timeout = timeout
+        self.max_tool_rounds = max_tool_rounds
 
     async def run(self, query: str, context: Context) -> str:
         from openai import AsyncOpenAI
@@ -136,19 +146,79 @@ class OpenAIAgent(Agent):
             messages.append({"role": "system", "content": context.system_prompt})
         messages.append({"role": "user", "content": query})
 
-        kwargs: dict[str, Any] = {
-            "model": self.model,
-            "max_tokens": 2000,
-            "messages": messages,
-        }
-        if context.tools:
-            kwargs["tools"] = context.tools
+        # No tools → simple single-call
+        if not context.tools:
+            response = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=self.model,
+                    max_tokens=2000,
+                    messages=messages,
+                ),
+                timeout=self.timeout,
+            )
+            return response.choices[0].message.content or ""
 
-        response = await asyncio.wait_for(
-            client.chat.completions.create(**kwargs),
-            timeout=self.timeout,
-        )
-        return response.choices[0].message.content or ""
+        # Tool-calling loop: call LLM → execute tool calls → repeat
+        openai_tools = context.tools
+        last_content = ""
+        for _ in range(self.max_tool_rounds):
+            response = await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=self.model,
+                    max_tokens=2000,
+                    messages=messages,
+                    tools=openai_tools,
+                ),
+                timeout=self.timeout,
+            )
+            msg = response.choices[0].message
+            last_content = msg.content or ""
+
+            # No tool calls → agent is done
+            if not msg.tool_calls:
+                return last_content
+
+            # Append the assistant message with tool calls
+            messages.append({
+                "role": "assistant",
+                "content": msg.content,
+                "tool_calls": [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments,
+                        },
+                    }
+                    for tc in msg.tool_calls
+                ],
+            })
+
+            # Execute each tool call via MCP registry
+            for tc in msg.tool_calls:
+                tool_result = await self._execute_tool_call(tc, context)
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": json.dumps(tool_result, default=str),
+                })
+
+        return last_content
+
+    async def _execute_tool_call(self, tool_call: Any, context: Context) -> Any:
+        """Execute a tool call via the MCP registry."""
+        import json as _json
+        name = tool_call.function.name
+        try:
+            arguments = _json.loads(tool_call.function.arguments)
+        except Exception:
+            arguments = {}
+
+        if context.mcp_registry:
+            return await context.mcp_registry.call_tool_by_name(name, arguments)
+
+        return {"error": f"No registry available to execute tool: {name}"}
 
 
 class AnthropicAgent(Agent):

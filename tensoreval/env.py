@@ -146,7 +146,7 @@ class Env:
 
         # Build Docker compose from config
         if self.agent or self.mcp:
-            from tensoreval.docker_compose import DockerCompose
+            from tensoreval.tools.docker import DockerCompose
 
             services = {}
             if self.agent:

@@ -154,3 +154,16 @@ class MCPToolRegistry:
             if server._tools:
                 tools.extend(t.to_openai_tool() for t in server._tools)
         return tools
+
+    async def call_tool_by_name(self, name: str, arguments: dict[str, Any]) -> Any:
+        """Find and call a tool by name across all registered servers.
+
+        Searches each server's cached tool list. Returns {"error": ...} if
+        the tool is not found on any server.
+        """
+        for server in self.servers.values():
+            if server._tools:
+                for tool in server._tools:
+                    if tool.name == name:
+                        return await tool.call(arguments)
+        return {"error": f"Tool not found: {name}"}
