@@ -44,10 +44,10 @@ class RulerGrader(Grader):
         self.rubric = rubric
 
     async def score(self, state: dict, **kwargs) -> float:
-        """Score a single response — falls back to simple heuristics.
+        """Score a single response using heuristic fallback.
 
-        For proper relative ranking, use score_group() via Evaluation.run()
-        which detects RulerGrader automatically.
+        When multiple samples are evaluated, _run_eval detects score_group
+        and calls it for proper relative ranking instead of this method.
         """
         completion = state.get("completion", [])
         answer = state.get("answer", "")

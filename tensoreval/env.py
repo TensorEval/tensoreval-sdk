@@ -27,7 +27,6 @@ Usage:
     })
 """
 
-import os
 from pathlib import Path
 from typing import Any, Callable
 
@@ -139,8 +138,8 @@ class Env:
         if self._started:
             return self._get_urls()
 
-        # If direct URLs set, no Docker needed
-        if self.agent_url and not self.agent:
+        # If direct agent_url set AND no Docker services needed, skip startup
+        if self.agent_url and not self.agent and not self.mcp:
             self._started = True
             return self._get_urls()
 

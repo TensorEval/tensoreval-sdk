@@ -19,7 +19,7 @@ import json
 import os
 import time
 from pathlib import Path
-from typing import Any, Callable, Awaitable
+from typing import Any
 
 from tensoreval.datasets import Datasets
 from tensoreval.graders.base import Grader
@@ -52,6 +52,10 @@ class EvaluationResult:
             return 0.0
         return sum(r.latency_ms for r in self.runs) / len(self.runs)
 
+    @property
+    def total_latency_ms(self) -> float:
+        return sum(r.latency_ms for r in self.runs)
+
     def summary(self) -> Summary:
         """Get aggregate summary."""
         return Summary(
@@ -61,7 +65,7 @@ class EvaluationResult:
             pass_rate=self.pass_rate,
             pass_count=sum(1 for r in self.runs if r.reward >= self.config.pass_threshold),
             fail_count=sum(1 for r in self.runs if r.reward < self.config.pass_threshold),
-            total_latency_ms=self.avg_latency_ms,
+            total_latency_ms=self.total_latency_ms,
         )
 
     def per_query(self) -> list[dict[str, Any]]:
@@ -266,8 +270,9 @@ class Evaluation:
             try:
                 await env.start()
                 env_started = True
-            except Exception:
-                pass
+            except Exception as e:
+                import sys
+                print(f"[tensoreval] warning: env.start() failed: {e}", file=sys.stderr)
 
         # Build MCP tool registry from env or config
         mcp_registry = None
@@ -344,11 +349,16 @@ class Evaluation:
 async def _run_eval(
     dataset: Datasets,
     grader: Grader,
-    agent: Any,  # Agent instance
+    agent: Any,
     config: EvalConfig,
     mcp_registry: Any = None,
 ) -> EvaluationResult:
-    """Internal: run the evaluation loop."""
+    """Internal: run the evaluation loop.
+
+    If the grader supports ``score_group`` (e.g. RulerGrader) and there are
+    multiple samples, responses are collected first then batch-ranked for
+    relative scoring. Otherwise each sample is scored individually.
+    """
     sem = asyncio.Semaphore(config.workers)
 
     # Pre-fetch MCP tools once (non-fatal if server is down)
@@ -358,16 +368,83 @@ async def _run_eval(
             await mcp_registry.list_all_tools()
             mcp_tools = mcp_registry.to_openai_tools()
         except Exception:
-            pass  # MCP server down — eval continues without tools
+            pass
 
+    use_group_scoring = hasattr(grader, "score_group") and len(dataset) > 1
+
+    if use_group_scoring:
+        # Phase 1: collect all responses in parallel
+        async def collect_one(idx: int) -> dict:
+            async with sem:
+                return await _collect_response(idx, dataset, agent, config, mcp_tools, mcp_registry)
+
+        collected = await asyncio.gather(*[collect_one(i) for i in range(len(dataset))])
+
+        # Phase 2: batch-score via score_group (relative ranking)
+        states = [c["state"] for c in collected]
+        try:
+            scores = await grader.score_group(states)
+        except Exception:
+            scores = [0.5] * len(collected)
+
+        runs = [
+            Run(
+                sample_id=dataset[i].id,
+                query=dataset[i].input,
+                answer=dataset[i].target,
+                response=collected[i]["response"],
+                reward=scores[i] if i < len(scores) else 0.0,
+                latency_ms=collected[i]["latency_ms"],
+            )
+            for i in range(len(dataset))
+        ]
+        return EvaluationResult(runs, dataset, config)
+
+    # Standard per-sample scoring
     async def eval_one(idx: int) -> Run:
         async with sem:
             return await _evaluate_single(idx, dataset, grader, agent, config, mcp_tools, mcp_registry)
 
     tasks = [eval_one(i) for i in range(len(dataset))]
     runs = await asyncio.gather(*tasks)
-
     return EvaluationResult(list(runs), dataset, config)
+
+
+async def _collect_response(
+    idx: int,
+    dataset: Datasets,
+    agent: Any,
+    config: EvalConfig,
+    mcp_tools: list[dict[str, Any]] | None = None,
+    mcp_registry: Any = None,
+) -> dict[str, Any]:
+    """Collect an agent response + grader state without scoring. Used for group scoring."""
+    from tensoreval.agents import Context
+
+    sample = dataset[idx]
+    start_time = time.monotonic()
+
+    context = Context(
+        query=sample.input,
+        system_prompt=config.system_prompt,
+        tools=mcp_tools or [],
+        metadata={"sample_id": sample.id, "index": idx},
+        mcp_registry=mcp_registry,
+    )
+
+    response = await agent.run(sample.input, context)
+    latency_ms = (time.monotonic() - start_time) * 1000
+
+    state = {
+        "query": sample.input,
+        "answer": sample.target,
+        "completion": [{"role": "assistant", "content": response}],
+        "info": {"rubrics": [{"name": r.name, "criteria": r.criteria, "weight": r.weight} for r in sample.rubrics]},
+        "prompt": [{"role": "user", "content": sample.input}],
+        "index": idx,
+    }
+
+    return {"response": response, "latency_ms": latency_ms, "state": state}
 
 
 async def _evaluate_single(
@@ -459,20 +536,19 @@ def _maybe_push_to_backend(results: EvaluationResult, trace_run: Any) -> None:
     base_url = os.environ.get("TENSOREVAL_BASE_URL", "http://localhost:4000")
     import sys
 
-    # Push eval results (short timeout — backend being down must not block)
+    client: TensorEvalClient | None = None
     try:
         client = TensorEvalClient(api_key=api_key, base_url=base_url, timeout=3.0)
         client.ingest_evaluation(results)
     except TensorEvalError as e:
         print(f"[tensoreval] backend push skipped: {e}", file=sys.stderr)
     except Exception:
-        pass  # Backend down/unreachable — local evals must still work
+        client = None  # Backend down/unreachable — local evals must still work
 
     # Push trace events if we have a run context with spans
-    if trace_run is not None and trace_run.spans:
+    if client and trace_run is not None and trace_run.spans:
         events = [s.to_dict() for s in trace_run.spans]
         try:
-            client = TensorEvalClient(api_key=api_key, base_url=base_url, timeout=3.0)
             client.ingest_trace(trace_run.name, events)
         except Exception:
             pass  # Non-fatal

@@ -12,9 +12,9 @@ Sinks (all opt-in, all independent):
 
   TENSOREVAL_TRACE=1              stdout (human-readable)
   TENSOREVAL_TRACE_JSONL=path     append-only JSONL
-  TENSOREVAL_TRACE_DASHBOARD=url  future: POST events to a TensorEval dashboard
-                                  endpoint (requires TENSOREVAL_API_KEY)
   tracer = ObservabilityTracer(sinks=[...])  explicit sink list
+  TENSOREVAL_API_KEY              pushes traces to TensorEval backend
+                                  (handled by TensorEvalClient in evaluation.py)
 
 Usage:
 
@@ -195,9 +195,6 @@ class ObservabilityTracer:
             jsonl = os.environ.get("TENSOREVAL_TRACE_JSONL")
             if jsonl:
                 self.sinks.append(_make_jsonl_sink(jsonl))
-            dashboard = os.environ.get("TENSOREVAL_TRACE_DASHBOARD")
-            if dashboard:
-                self.sinks.append(_make_dashboard_sink(dashboard))
 
     def emit(self, event: dict) -> None:
         for sink in self.sinks:
@@ -356,43 +353,6 @@ def _make_jsonl_sink(path: str) -> Callable[[dict], None]:
     def sink(event: dict) -> None:
         fh.write(json.dumps(event, default=str) + "\n")
         fh.flush()
-    return sink
-
-
-def _make_dashboard_sink(base_url: str) -> Callable[[dict], None]:
-    """Sink that POSTs events to a TensorEval dashboard endpoint.
-
-    Activated by TENSOREVAL_TRACE_DASHBOARD=<base_url>.
-    Requires TENSOREVAL_API_KEY to be set in the environment, otherwise
-    all events are silently dropped.
-
-    This is a placeholder for the future TensorEval hosted dashboard.
-    The POST body is the same JSON dict that every sink receives.
-    """
-    api_key = os.environ.get("TENSOREVAL_API_KEY", "")
-    if not api_key:
-        def drop(_event: dict) -> None:
-            pass
-        return drop
-
-    import urllib.request
-
-    def sink(event: dict) -> None:
-        data = json.dumps(event, default=str).encode()
-        req = urllib.request.Request(
-            base_url.rstrip("/") + "/api/v1/traces",
-            data=data,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
-            method="POST",
-        )
-        try:
-            urllib.request.urlopen(req, timeout=5.0)
-        except Exception:
-            pass         # fire-and-forget; dashboard being down must not break eval
-
     return sink
 
 

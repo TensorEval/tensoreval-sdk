@@ -208,10 +208,9 @@ class OpenAIAgent(Agent):
 
     async def _execute_tool_call(self, tool_call: Any, context: Context) -> Any:
         """Execute a tool call via the MCP registry."""
-        import json as _json
         name = tool_call.function.name
         try:
-            arguments = _json.loads(tool_call.function.arguments)
+            arguments = json.loads(tool_call.function.arguments)
         except Exception:
             arguments = {}
 
@@ -224,46 +223,100 @@ class OpenAIAgent(Agent):
 class AnthropicAgent(Agent):
     """Agent that calls an Anthropic-compatible API.
 
+    Supports a multi-turn tool-calling loop when MCP tools are provided,
+    mirroring OpenAIAgent's behavior.
+
     Usage:
         agent = AnthropicAgent(
-            model="mimo-v2.5-pro",
-            api_key="tp-...",
-            base_url="https://token-plan-sgp.xiaomimimo.com/anthropic",
+            model="claude-sonnet-4-5",
+            api_key="sk-ant-...",
+            base_url="https://api.anthropic.com",
         )
     """
 
     def __init__(
         self,
-        model: str = "mimo-v2.5-pro",
+        model: str = "claude-sonnet-4-5",
         api_key: str = "",
         base_url: str = "",
         timeout: float = 60.0,
+        max_tool_rounds: int = 10,
     ):
         self.model = model
         self.api_key = api_key
         self.base_url = base_url
         self.timeout = timeout
+        self.max_tool_rounds = max_tool_rounds
 
     async def run(self, query: str, context: Context) -> str:
         import anthropic
 
         client = anthropic.AsyncAnthropic(api_key=self.api_key, base_url=self.base_url)
+        messages: list[dict[str, Any]] = [{"role": "user", "content": query}]
+
         kwargs: dict[str, Any] = {
             "model": self.model,
             "max_tokens": 2000,
-            "messages": [{"role": "user", "content": query}],
+            "messages": messages,
         }
         if context.system_prompt:
             kwargs["system"] = context.system_prompt
 
-        response = await asyncio.wait_for(
-            client.messages.create(**kwargs),
-            timeout=self.timeout,
-        )
-        for block in response.content:
-            if hasattr(block, "text"):
-                return block.text
-        return ""
+        # No tools → simple call
+        if not context.tools:
+            response = await asyncio.wait_for(client.messages.create(**kwargs), timeout=self.timeout)
+            for block in response.content:
+                if hasattr(block, "text"):
+                    return block.text
+            return ""
+
+        # Tool-calling loop
+        # Convert OpenAI tool format → Anthropic tool format
+        anthropic_tools = [
+            {
+                "name": t["function"]["name"],
+                "description": t["function"].get("description", ""),
+                "input_schema": t["function"].get("parameters", {"type": "object", "properties": {}}),
+            }
+            for t in context.tools
+        ]
+        kwargs["tools"] = anthropic_tools
+
+        last_text = ""
+        for _ in range(self.max_tool_rounds):
+            response = await asyncio.wait_for(client.messages.create(**kwargs), timeout=self.timeout)
+
+            # Check if the model wants to use tools
+            if response.stop_reason != "tool_use":
+                for block in response.content:
+                    if hasattr(block, "text"):
+                        return block.text
+                return last_text
+
+            # Extract text + tool calls, execute them
+            assistant_content: list[dict[str, Any]] = []
+            for block in response.content:
+                if hasattr(block, "text"):
+                    last_text = block.text
+                    assistant_content.append({"type": "text", "text": block.text})
+                elif hasattr(block, "name"):  # ToolUseBlock
+                    tool_result = await context.mcp_registry.call_tool_by_name(
+                        block.name, block.input if isinstance(block.input, dict) else {}
+                    )
+                    assistant_content.append(block.model_dump())
+                    messages.append({
+                        "role": "user",
+                        "content": [{
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": json.dumps(tool_result, default=str),
+                        }],
+                    })
+
+            messages.append({"role": "assistant", "content": assistant_content})
+            kwargs["messages"] = messages
+
+        return last_text
 
 
 class EndpointAgent(Agent):
@@ -273,8 +326,9 @@ class EndpointAgent(Agent):
         agent = EndpointAgent(url="http://localhost:8000/v1/chat/completions")
     """
 
-    def __init__(self, url: str, timeout: float = 120.0):
+    def __init__(self, url: str, model: str = "default", timeout: float = 120.0):
         self.url = url
+        self.model = model
         self.timeout = timeout
 
     async def run(self, query: str, context: Context) -> str:
@@ -285,10 +339,14 @@ class EndpointAgent(Agent):
             messages.append({"role": "system", "content": context.system_prompt})
         messages.append({"role": "user", "content": query})
 
+        body: dict[str, Any] = {"model": self.model, "messages": messages}
+        if context.tools:
+            body["tools"] = context.tools
+
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 self.url,
-                json={"messages": messages},
+                json=body,
                 timeout=self.timeout,
             )
             data = response.json()
@@ -306,7 +364,7 @@ def resolve_agent(
 
     Accepts:
     - Agent instance → returned as-is
-   - Callable (async function) → wrapped in FunctionAgent
+    - Callable (async function) → wrapped in FunctionAgent
     - String starting with "http" → EndpointAgent
     - String starting with "anthropic:" → AnthropicAgent
     - String with api_key/base_url → OpenAIAgent
