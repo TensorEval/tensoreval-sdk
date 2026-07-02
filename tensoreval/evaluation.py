@@ -232,25 +232,48 @@ class Evaluation:
                 except (ValueError, IndexError):
                     pass
 
-        # Resolve agent
+        # ── Model config from env (TENSOREVAL_MODEL_*) ──────────────
+        # Separate from backend API key (TENSOREVAL_API_KEY for pushing results)
+        if not config.api_key:
+            config.api_key = (
+                os.environ.get("TENSOREVAL_MODEL_API_KEY")
+                or os.environ.get("TENSOREVAL_API_KEY")
+                or os.environ.get("OPENAI_API_KEY", "")
+            )
+        if not config.base_url:
+            config.base_url = (
+                os.environ.get("TENSOREVAL_MODEL_BASE_URL")
+                or os.environ.get("TENSOREVAL_BASE_URL")
+                or "https://api.openai.com/v1"
+            )
+        if config.model == "gpt-4o":  # still default → check env
+            env_model = os.environ.get("TENSOREVAL_MODEL_NAME")
+            if env_model:
+                config.model = env_model
+
+        # Resolve agent — uses model config from above
         resolved_agent = resolve_agent(
             agent=agent,
             model=config.model,
-            api_key=config.api_key or os.environ.get("TENSOREVAL_API_KEY", os.environ.get("OPENAI_API_KEY", "")),
-            base_url=config.base_url or os.environ.get("TENSOREVAL_BASE_URL", ""),
+            api_key=config.api_key,
+            base_url=config.base_url,
             agent_port=config.agent_port,
         )
 
-        # Default grader
+        # Default grader: AgentGrader (LLM-as-judge) when model config exists,
+        # RubricGrader (simple match) as offline fallback
         if grader is None:
-            from tensoreval.graders.rubric_grader import RubricGrader
-            grader = RubricGrader()
-
-        # Resolve API key
-        if not config.api_key:
-            config.api_key = os.environ.get("TENSOREVAL_API_KEY", os.environ.get("OPENAI_API_KEY", ""))
-        if not config.base_url:
-            config.base_url = os.environ.get("TENSOREVAL_BASE_URL", "https://api.openai.com/v1")
+            if config.api_key and config.api_key != "":
+                from tensoreval.graders.agent_grader import AgentGrader
+                grader = AgentGrader(
+                    model=config.model,
+                    api_key=config.api_key,
+                    base_url=config.base_url,
+                    fallback_on_error=True,
+                )
+            else:
+                from tensoreval.graders.rubric_grader import RubricGrader
+                grader = RubricGrader(simple=True)
 
         from tensoreval.observability import current_run, get_tracer
 

@@ -3,15 +3,22 @@
 The LLM reads each rubric, looks at the response, and scores it 0.0-1.0.
 No keyword matching. No hacks. The LLM understands what "empathy" means.
 
-Usage:
-    grader = te.AgentGrader(
-        model="mimo-v2.5-pro",
-        api_key="tp-...",
-        base_url="https://token-plan-sgp.xiaomimimo.com/anthropic",
-    )
+If a sample has NO rubrics defined, the grader auto-generates appropriate
+rubrics from the query using the LLM (auto-rubric generation).
 
-    # Then just run evaluation — rubrics come from each sample
-    results = te.Evaluation.run(ds, grader, env=env)
+Usage:
+    # Option 1: explicit rubrics in dataset
+    grader = te.AgentGrader(model="mimo-v2.5-pro", api_key="...", base_url="...")
+
+    # Option 2: no rubrics → auto-generated from query
+    ds = te.Datasets.load_from_dict([{"query": "What is 2+2?", "reference_answer": "4"}])
+    results = te.Evaluation.run(ds, grader, agent=my_agent)
+
+    # Option 3: env-based config (no manual grader setup)
+    #   TENSOREVAL_MODEL_API_KEY=...
+    #   TENSOREVAL_MODEL_BASE_URL=...
+    #   TENSOREVAL_MODEL_NAME=mimo-v2.5-pro
+    results = te.Evaluation.run(ds, agent=my_agent)  # grader auto-created from env
 """
 
 import asyncio
@@ -40,6 +47,18 @@ Output ONLY a JSON object:
 {{"scores": [{{"name": "<rubric_name>", "score": <0.0-1.0>, "reason": "<brief>"}}]}}"""
 
 
+AUTO_RUBRIC_PROMPT = """Generate evaluation rubrics for this query. The agent will respond to this query and needs to be graded.
+
+Query: {query}
+
+Generate 3-4 rubrics that a judge would use to evaluate ANY response to this query. Think about what makes a good response here — accuracy, tone, completeness, format, etc.
+
+Output ONLY a JSON array:
+[{{"name": "<short_name>", "criteria": "<what makes a good response for this rubric>", "weight": <0.0-1.0>}}]
+
+Weights must sum to 1.0."""
+
+
 class AgentGrader(Grader):
     """LLM-as-judge grader.
 
@@ -66,9 +85,14 @@ class AgentGrader(Grader):
         self.api_key = api_key
         self.base_url = base_url
         self.fallback_on_error = fallback_on_error
+        self._rubric_cache: dict[str, list[dict]] = {}
 
     async def score(self, state: dict, **kwargs) -> float:
-        """Score response using LLM judge against rubrics."""
+        """Score response using LLM judge against rubrics.
+
+        If no rubrics are defined for this sample, auto-generates them
+        from the query using the LLM.
+        """
         completion = state.get("completion", [])
         answer = state.get("answer", "")
         rubrics = state.get("info", {}).get("rubrics", [])
@@ -87,7 +111,14 @@ class AgentGrader(Grader):
         last = completion[-1]
         response = last.get("content", "") if isinstance(last, dict) else str(getattr(last, "content", ""))
 
-        # If no rubrics, do simple answer match
+        # ── Auto-generate rubrics if none defined ───────────────────
+        if not rubrics:
+            try:
+                rubrics = await self._auto_generate_rubrics(query)
+            except Exception:
+                pass
+
+        # If still no rubrics, do simple answer match
         if not rubrics:
             return 1.0 if answer and answer.lower() in response.lower() else 0.0
 
@@ -117,6 +148,45 @@ class AgentGrader(Grader):
             if self.fallback_on_error:
                 return 1.0 if answer and answer.lower() in response.lower() else 0.0
             raise RuntimeError(f"AgentGrader judge call failed: {e}") from e
+
+    async def _auto_generate_rubrics(self, query: str) -> list[dict]:
+        """Generate rubrics from the query using the LLM. Cached per query."""
+        cache_key = query[:200]
+        if cache_key in self._rubric_cache:
+            return self._rubric_cache[cache_key]
+
+        prompt = AUTO_RUBRIC_PROMPT.format(query=query[:500])
+
+        is_anthropic = self.base_url and "anthropic" in self.base_url.lower()
+        if is_anthropic:
+            content = await self._call_anthropic(prompt)
+        else:
+            content = await self._call_openai(prompt)
+
+        rubrics = self._parse_rubrics(content)
+        if rubrics:
+            self._rubric_cache[cache_key] = rubrics
+        return rubrics
+
+    def _parse_rubrics(self, content: str) -> list[dict]:
+        """Parse LLM output into a rubrics list."""
+        try:
+            match = re.search(r'\[.*\]', content, re.DOTALL)
+            if match:
+                rubrics = json.loads(match.group())
+                # Validate structure
+                valid = []
+                for r in rubrics:
+                    if isinstance(r, dict) and "name" in r and "criteria" in r:
+                        valid.append({
+                            "name": r["name"],
+                            "criteria": r["criteria"],
+                            "weight": float(r.get("weight", 1.0 / len(rubrics))),
+                        })
+                return valid if valid else []
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return []
 
     async def _call_judge(self, prompt: str) -> list[dict]:
         """Call the LLM judge and parse scores."""
@@ -149,21 +219,33 @@ class AgentGrader(Grader):
         return ""
 
     async def _call_openai(self, prompt: str) -> str:
-        """Call OpenAI-compatible API."""
+        """Call OpenAI-compatible API with rate-limit retry."""
         from openai import AsyncOpenAI
         client = AsyncOpenAI(api_key=self.api_key or "dummy", base_url=self.base_url or "https://api.openai.com/v1")
-        response = await asyncio.wait_for(
-            client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "You are an evaluation judge. Output only valid JSON."},
-                    {"role": "user", "content": prompt},
-                ],
-                max_tokens=500,
-            ),
-            timeout=60.0,
-        )
-        return response.choices[0].message.content or ""
+
+        async def _call():
+            return await asyncio.wait_for(
+                client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": "You are an evaluation judge. Output only valid JSON."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    max_tokens=500,
+                ),
+                timeout=60.0,
+            )
+
+        for attempt in range(4):
+            try:
+                response = await _call()
+                return response.choices[0].message.content or ""
+            except Exception as e:
+                is_rate_limit = getattr(e, "status_code", 0) == 429 or "429" in str(e) or "rate" in str(e).lower()
+                if not is_rate_limit or attempt == 3:
+                    raise
+                await asyncio.sleep(3.0 * (attempt + 1))
+        return ""
 
     def _parse_scores(self, content: str) -> list[dict]:
         """Parse LLM judge output into scores list."""

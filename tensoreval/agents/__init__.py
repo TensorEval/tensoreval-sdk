@@ -34,9 +34,30 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Awaitable
+
+
+async def _call_with_rate_limit_retry(coro_factory, *, max_retries=3, base_delay=2.0):
+    """Call an async function with retry on rate-limit (429) errors.
+
+    coor_factory: a zero-arg callable that returns a fresh coroutine each call.
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            return await coro_factory()
+        except Exception as e:
+            is_rate_limit = (
+                getattr(e, "status_code", None) == 429
+                or "429" in str(e)
+                or "rate" in str(e).lower()
+            )
+            if not is_rate_limit or attempt == max_retries:
+                raise
+            delay = base_delay * (attempt + 1)
+            await asyncio.sleep(delay)
 
 
 @dataclass
@@ -148,13 +169,15 @@ class OpenAIAgent(Agent):
 
         # No tools → simple single-call
         if not context.tools:
-            response = await asyncio.wait_for(
-                client.chat.completions.create(
-                    model=self.model,
-                    max_tokens=2000,
-                    messages=messages,
-                ),
-                timeout=self.timeout,
+            response = await _call_with_rate_limit_retry(
+                lambda: asyncio.wait_for(
+                    client.chat.completions.create(
+                        model=self.model,
+                        max_tokens=2000,
+                        messages=messages,
+                    ),
+                    timeout=self.timeout,
+                )
             )
             return response.choices[0].message.content or ""
 
