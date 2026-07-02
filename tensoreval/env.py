@@ -47,10 +47,13 @@ class Env:
         mcp: dict[str, Any] | None = None,
         env_file: str | None = None,
         config: dict[str, Any] | None = None,
+        image: str | None = None,
+        agent_port: int | None = None,
+        mcp_port: int | None = None,
     ):
         self.system_prompt = system_prompt
         self.tools = tools or []
-        self.docker_image = docker_image
+        self.docker_image = docker_image or image
         self.dockerfile = dockerfile
         self.compose_yaml = compose_yaml
         self.mcp_url = mcp_url
@@ -59,6 +62,10 @@ class Env:
         self.mcp = mcp
         self.env_file = env_file
         self.config = config or {}
+        self.agent_port = agent_port
+        self.mcp_port = mcp_port
+        self.image = image
+        self._started = False
         self._compose = None
         self._started = False
 

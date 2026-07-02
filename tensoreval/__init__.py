@@ -37,10 +37,13 @@ from tensoreval.datasets import Datasets
 from tensoreval.evaluation import Evaluation, EvaluationResult
 
 # Graders
-from tensoreval.graders.base import Grader
+from tensoreval.graders.base import Grader as _BaseGrader
 from tensoreval.graders.rubric_grader import RubricGrader
 from tensoreval.graders.agent_grader import AgentGrader
 from tensoreval.graders.ruler_grader import RulerGrader
+
+# Grader orchestrator (overrides base Grader name — this is te.Grader)
+from tensoreval.grader import Grader, GradingResult, GradedRun, TrajectoryStep
 
 # Agents
 from tensoreval.agents import (
@@ -90,6 +93,8 @@ __all__ = [
     "GraderType", "Difficulty",
     # Core
     "Datasets", "Evaluation", "EvaluationResult",
+    # Grader
+    "Grader", "GradingResult", "GradedRun", "TrajectoryStep",
     # Graders
     "Grader", "RubricGrader", "AgentGrader", "RulerGrader",
     # Agents
