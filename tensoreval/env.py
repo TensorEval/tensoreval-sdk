@@ -1,4 +1,4 @@
-"""Env — Environment configuration and lifecycle manager.
+"""Environment configuration and lifecycle manager.
 
 Handles:
 - System prompt
@@ -9,29 +9,29 @@ Handles:
 
 Usage:
     # Simple (no Docker)
-    env = te.Env.from_dict({"system_prompt": "..."})
+    env = te.Environment(system_prompt="...")
 
     # With Docker
-    env = te.Env.from_dict({
-        "system_prompt": "...",
-        "agent": {"image": "python:3.12-slim", "port": 8000, "env": {"KEY": "val"}},
-        "mcp": {"image": "node:18-slim", "port": 9000},
-        "env_file": ".env",
-    })
+    env = te.Environment(
+        system_prompt="...",
+        agent={"image": "python:3.12-slim", "port": 8000, "env": {"KEY": "val"}},
+        mcp={"image": "node:18-slim", "port": 9000},
+        env_file=".env",
+    )
 
     # With direct URLs (no Docker)
-    env = te.Env.from_dict({
-        "system_prompt": "...",
-        "agent_url": "http://localhost:8000",
-        "mcp_url": "http://localhost:9000/mcp",
-    })
+    env = te.Environment(
+        system_prompt="...",
+        agent_url="http://localhost:8000",
+        mcp_url="http://localhost:9000/mcp",
+    )
 """
 
 from pathlib import Path
 from typing import Any, Callable
 
 
-class Env:
+class Environment:
     """Environment configuration and lifecycle manager."""
 
     def __init__(
@@ -42,6 +42,7 @@ class Env:
         dockerfile: str | None = None,
         compose_yaml: str | None = None,
         mcp_url: str | None = None,
+        mcp_servers: list[Any] | None = None,
         agent_url: str | None = None,
         agent: dict[str, Any] | None = None,
         mcp: dict[str, Any] | None = None,
@@ -57,6 +58,7 @@ class Env:
         self.dockerfile = dockerfile
         self.compose_yaml = compose_yaml
         self.mcp_url = mcp_url
+        self.mcp_servers = mcp_servers or []
         self.agent_url = agent_url
         self.agent = agent
         self.mcp = mcp
@@ -67,10 +69,9 @@ class Env:
         self.image = image
         self._started = False
         self._compose = None
-        self._started = False
 
     @classmethod
-    def load_from_file(cls, path: str | Path) -> "Env":
+    def load_from_file(cls, path: str | Path) -> "Environment":
         """Load environment from YAML, JSON, or Python file."""
         path = Path(path)
         if not path.exists():
@@ -87,8 +88,8 @@ class Env:
             raise ValueError(f"Unsupported file type: {suffix}")
 
     @classmethod
-    def from_dict(cls, config: dict[str, Any]) -> "Env":
-        """Create from dict config."""
+    def from_dict(cls, config: dict[str, Any]) -> "Environment":
+        """Create from dict config. Prefer ``Environment(...)`` for new code."""
         return cls(
             system_prompt=config.get("system_prompt"),
             tools=config.get("tools"),
@@ -96,15 +97,19 @@ class Env:
             dockerfile=config.get("dockerfile"),
             compose_yaml=config.get("compose_yaml"),
             mcp_url=config.get("mcp_url"),
+            mcp_servers=config.get("mcp_servers"),
             agent_url=config.get("agent_url"),
             agent=config.get("agent"),
             mcp=config.get("mcp"),
             env_file=config.get("env_file"),
+            image=config.get("image"),
+            agent_port=config.get("agent_port"),
+            mcp_port=config.get("mcp_port"),
             config=config,
         )
 
     @classmethod
-    def _load_yaml(cls, path: Path) -> "Env":
+    def _load_yaml(cls, path: Path) -> "Environment":
         try:
             import yaml
         except ImportError:
@@ -113,13 +118,13 @@ class Env:
             return cls.from_dict(yaml.safe_load(f))
 
     @classmethod
-    def _load_json(cls, path: Path) -> "Env":
+    def _load_json(cls, path: Path) -> "Environment":
         import json
         with open(path) as f:
             return cls.from_dict(json.load(f))
 
     @classmethod
-    def _load_python(cls, path: Path) -> "Env":
+    def _load_python(cls, path: Path) -> "Environment":
         import importlib.util
         spec = importlib.util.spec_from_file_location("env_module", path)
         module = importlib.util.module_from_spec(spec)
@@ -152,19 +157,7 @@ class Env:
 
         # Build Docker compose from config
         if self.agent or self.mcp:
-            from tensoreval.tools.docker import DockerCompose
-
-            services = {}
-            if self.agent:
-                services["agent"] = self.agent
-            if self.mcp:
-                services["mcp-server"] = self.mcp
-
-            self._compose = DockerCompose(
-                services=services,
-                compose_yaml=self.compose_yaml,
-                env_file=self.env_file,
-            )
+            self._compose = self._build_compose()
 
             urls = await self._compose.up()
 
@@ -182,6 +175,58 @@ class Env:
             await self._compose.down()
             self._compose = None
         self._started = False
+
+    def to_compose_yaml(self) -> str:
+        """Return Docker Compose YAML for this environment's Docker services."""
+        return self._build_compose()._generate_compose_yaml()
+
+    def get_agent_url(self) -> str | None:
+        """Get the configured or Docker-derived agent URL."""
+        if self.agent_url:
+            return self.agent_url
+        if self.agent and "port" in self.agent:
+            return f"http://localhost:{self.agent['port']}"
+        return None
+
+    def get_mcp_url(self) -> str | None:
+        """Get the configured or Docker-derived MCP URL."""
+        if self.mcp_url:
+            return self.mcp_url
+        if self.mcp and "port" in self.mcp:
+            return f"http://localhost:{self.mcp['port']}/mcp"
+        return None
+
+    async def exec(self, service: str, cmd: list[str], timeout: int = 30) -> tuple[str, str, int]:
+        """Execute a command inside a running environment service container."""
+        if not self._compose:
+            raise RuntimeError("Environment not started. Call start() first.")
+        return await self._compose.exec(service, cmd, timeout=timeout)
+
+    async def write_file(self, service: str, path: str, contents: str | bytes) -> None:
+        """Write a file into a running environment service container."""
+        if not self._compose:
+            raise RuntimeError("Environment not started. Call start() first.")
+        await self._compose.write_file(service, path, contents)
+
+    async def read_file(self, service: str, path: str) -> str:
+        """Read a file from a running environment service container."""
+        if not self._compose:
+            raise RuntimeError("Environment not started. Call start() first.")
+        return await self._compose.read_file(service, path)
+
+    def _build_compose(self):
+        from tensoreval.tools.docker import DockerCompose
+
+        services = {}
+        if self.agent:
+            services["agent"] = self.agent
+        if self.mcp:
+            services["mcp-server"] = self.mcp
+        return DockerCompose(
+            services=services,
+            compose_yaml=self.compose_yaml,
+            env_file=self.env_file,
+        )
 
     def _get_urls(self) -> dict[str, str]:
         urls = {}
@@ -210,4 +255,4 @@ class Env:
             parts.append("agent=docker")
         if self.mcp:
             parts.append("mcp=docker")
-        return f"Env({', '.join(parts)})"
+        return f"Environment({', '.join(parts)})"

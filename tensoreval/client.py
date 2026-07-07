@@ -32,6 +32,10 @@ if TYPE_CHECKING:
     from tensoreval.evaluation import EvaluationResult
 
 
+def _without_none(body: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in body.items() if value is not None}
+
+
 class TensorEvalClient:
     """HTTP client for the TensorEval backend (API-key authenticated).
 
@@ -106,7 +110,7 @@ class TensorEvalClient:
         Returns {ingested, evaluation_run_id, result_count}.
         """
         summary = result.summary()
-        body = {
+        body = _without_none({
             "experiment_id": experiment_id,
             "model": summary.model,
             "summary": summary.to_dict(),
@@ -119,12 +123,68 @@ class TensorEvalClient:
                     "reward": r.reward,
                     "latency_ms": r.latency_ms,
                     "error": r.error,
+                    "metadata": r.metadata,
                 }
                 for r in result.runs
             ],
             "metadata": metadata or {},
-        }
+        })
         return self._request("POST", "/api/sdk/evaluations", body)
+
+    def start_evaluation(
+        self,
+        model: str,
+        total_count: int,
+        experiment_id: str | None = None,
+        name: str | None = None,
+        metadata: dict | None = None,
+    ) -> dict:
+        """Create an in-progress dashboard evaluation for live SDK updates."""
+        body = _without_none({
+            "model": model,
+            "total_count": total_count,
+            "experiment_id": experiment_id,
+            "name": name,
+            "metadata": metadata or {},
+        })
+        return self._request("POST", "/api/sdk/evaluations/start", body)
+
+    def append_evaluation_result(
+        self,
+        evaluation_run_id: str,
+        run: Any,
+        total_count: int | None = None,
+    ) -> dict:
+        """Append one per-query result to a live SDK evaluation."""
+        body = _without_none({
+            "result": {
+                "sample_id": run.sample_id,
+                "query": run.query,
+                "answer": run.answer,
+                "response": run.response,
+                "reward": run.reward,
+                "latency_ms": run.latency_ms,
+                "error": run.error,
+                "metadata": run.metadata,
+            },
+            "total_count": total_count,
+        })
+        return self._request("POST", f"/api/sdk/evaluations/{evaluation_run_id}/results", body)
+
+    def complete_evaluation(
+        self,
+        evaluation_run_id: str,
+        summary: dict | None = None,
+        failed: bool = False,
+        progress: str | None = None,
+    ) -> dict:
+        """Mark a live SDK evaluation completed or failed."""
+        body = _without_none({
+            "status": "failed" if failed else "completed",
+            "summary": summary or {},
+            "progress": progress,
+        })
+        return self._request("POST", f"/api/sdk/evaluations/{evaluation_run_id}/complete", body)
 
     def ingest_trace(self, run_name: str, events: list[dict]) -> dict:
         """Push observability trace events to the backend.

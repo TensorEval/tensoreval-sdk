@@ -9,7 +9,7 @@ Usage:
     ])
 
     # Create grader
-    grader = te.RubricGrader(model="gpt-4o", api_key="sk-...", base_url="https://api.openai.com/v1")
+    grader = te.VercelAgentGrader()
 
     # Run evaluation — agent can be a function, class, URL, or model name
     results = te.Evaluation.run(ds, grader, agent=my_agent_function)
@@ -37,13 +37,8 @@ from tensoreval.datasets import Datasets
 from tensoreval.evaluation import Evaluation, EvaluationResult
 
 # Graders
-from tensoreval.graders.base import Grader as _BaseGrader
-from tensoreval.graders.rubric_grader import RubricGrader
-from tensoreval.graders.agent_grader import AgentGrader
-from tensoreval.graders.ruler_grader import RulerGrader
-
-# Grader orchestrator (overrides base Grader name — this is te.Grader)
-from tensoreval.grader import Grader, GradingResult, GradedRun, TrajectoryStep
+from tensoreval.graders.agent_grader import AgentGrader, VercelAgentGrader
+from tensoreval.graders.verification_grader import VerificationGrader
 
 # Agents
 from tensoreval.agents import (
@@ -51,19 +46,16 @@ from tensoreval.agents import (
     Context,
     FunctionAgent,
     OpenAIAgent,
-    AnthropicAgent,
-    EndpointAgent,
 )
 
 # Environment config
-from tensoreval.env import Env
+from tensoreval.env import Environment
 
 # Tools
-from tensoreval.tools.docker import DockerCompose
-from tensoreval.tools.mcp import MCPTool, MCPServer, MCPToolRegistry
+from tensoreval.tools.mcp import LocalTool, MCPTool, MCPServer, tool
 
-# Metrics
-from tensoreval.metrics.voice import VoiceMetrics, IndianLanguageMetrics, AudioMetrics
+# Optional integrations namespace (does not import optional dependencies)
+import tensoreval.integrations as integrations
 
 # Utilities
 from tensoreval.utils.data_utils import extract_boxed_answer, extract_hash_answer
@@ -93,18 +85,16 @@ __all__ = [
     "GraderType", "Difficulty",
     # Core
     "Datasets", "Evaluation", "EvaluationResult",
-    # Grader
-    "Grader", "GradingResult", "GradedRun", "TrajectoryStep",
     # Graders
-    "Grader", "RubricGrader", "AgentGrader", "RulerGrader",
+    "AgentGrader", "VercelAgentGrader", "VerificationGrader",
     # Agents
-    "Agent", "Context", "FunctionAgent", "OpenAIAgent", "AnthropicAgent", "EndpointAgent",
+    "Agent", "Context", "FunctionAgent", "OpenAIAgent",
     # Environment
-    "Env",
+    "Environment",
     # Tools
-    "DockerCompose", "MCPTool", "MCPServer", "MCPToolRegistry",
-    # Metrics
-    "VoiceMetrics", "IndianLanguageMetrics", "AudioMetrics",
+    "LocalTool", "MCPTool", "MCPServer", "tool",
+    # Integrations
+    "integrations",
     # Utilities
     "extract_boxed_answer", "extract_hash_answer",
     # Observability

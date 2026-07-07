@@ -75,12 +75,14 @@ class Run:
 class EvalConfig:
     """Configuration for an evaluation run."""
 
-    model: str = "gpt-4o"
+    model: str = "openai/gpt-5.5"
     api_key: str | None = None
     base_url: str | None = None
     workers: int = 4
     agent_port: int | None = None
     mcp_port: int | None = None
+    mcp_servers: list[Any] = field(default_factory=list)
+    tools: list[Any] = field(default_factory=list)
     system_prompt: str | None = None
     timeout: float = 60.0
     pass_threshold: float = 0.8

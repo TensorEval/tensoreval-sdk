@@ -128,10 +128,15 @@ def _row_to_sample(row: dict[str, Any], index: int) -> Sample:
     raw_rubrics = row.get("rubrics", [])
     rubrics = [Rubric.from_dict(r) for r in raw_rubrics] if raw_rubrics else []
 
+    metadata = dict(row.get("metadata", row.get("info", {})) or {})
+    for key in ("category", "difficulty"):
+        if key in row and key not in metadata:
+            metadata[key] = row[key]
+
     return Sample(
         input=input_text,
         target=target,
         id=row.get("id", f"q_{index + 1}"),
         rubrics=rubrics,
-        metadata=row.get("metadata", row.get("info", {})),
+        metadata=metadata,
     )

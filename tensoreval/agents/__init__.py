@@ -5,7 +5,6 @@ TensorEval supports multiple ways to bring your own agent:
 1. **Function** — simplest, just pass `async def my_agent(query) -> str`
 2. **Agent class** — extend `Agent` for more control (tools, state, etc.)
 3. **OpenAI endpoint** — point at any OpenAI-compatible API
-4. **Anthropic endpoint** — point at Anthropic/Mimo API
 
 Usage:
     # Option 1: Function (simplest)
@@ -26,8 +25,6 @@ Usage:
     # Option 3: OpenAI endpoint
     results = Evaluation.run(dataset, grader, agent="http://localhost:8000")
 
-    # Option 4: Anthropic endpoint
-    results = Evaluation.run(dataset, grader, agent="anthropic:mimo-v2.5-pro")
 """
 
 from __future__ import annotations
@@ -243,139 +240,6 @@ class OpenAIAgent(Agent):
         return {"error": f"No registry available to execute tool: {name}"}
 
 
-class AnthropicAgent(Agent):
-    """Agent that calls an Anthropic-compatible API.
-
-    Supports a multi-turn tool-calling loop when MCP tools are provided,
-    mirroring OpenAIAgent's behavior.
-
-    Usage:
-        agent = AnthropicAgent(
-            model="claude-sonnet-4-5",
-            api_key="sk-ant-...",
-            base_url="https://api.anthropic.com",
-        )
-    """
-
-    def __init__(
-        self,
-        model: str = "claude-sonnet-4-5",
-        api_key: str = "",
-        base_url: str = "",
-        timeout: float = 60.0,
-        max_tool_rounds: int = 10,
-    ):
-        self.model = model
-        self.api_key = api_key
-        self.base_url = base_url
-        self.timeout = timeout
-        self.max_tool_rounds = max_tool_rounds
-
-    async def run(self, query: str, context: Context) -> str:
-        import anthropic
-
-        client = anthropic.AsyncAnthropic(api_key=self.api_key, base_url=self.base_url)
-        messages: list[dict[str, Any]] = [{"role": "user", "content": query}]
-
-        kwargs: dict[str, Any] = {
-            "model": self.model,
-            "max_tokens": 2000,
-            "messages": messages,
-        }
-        if context.system_prompt:
-            kwargs["system"] = context.system_prompt
-
-        # No tools → simple call
-        if not context.tools:
-            response = await asyncio.wait_for(client.messages.create(**kwargs), timeout=self.timeout)
-            for block in response.content:
-                if hasattr(block, "text"):
-                    return block.text
-            return ""
-
-        # Tool-calling loop
-        # Convert OpenAI tool format → Anthropic tool format
-        anthropic_tools = [
-            {
-                "name": t["function"]["name"],
-                "description": t["function"].get("description", ""),
-                "input_schema": t["function"].get("parameters", {"type": "object", "properties": {}}),
-            }
-            for t in context.tools
-        ]
-        kwargs["tools"] = anthropic_tools
-
-        last_text = ""
-        for _ in range(self.max_tool_rounds):
-            response = await asyncio.wait_for(client.messages.create(**kwargs), timeout=self.timeout)
-
-            # Check if the model wants to use tools
-            if response.stop_reason != "tool_use":
-                for block in response.content:
-                    if hasattr(block, "text"):
-                        return block.text
-                return last_text
-
-            # Extract text + tool calls, execute them
-            assistant_content: list[dict[str, Any]] = []
-            for block in response.content:
-                if hasattr(block, "text"):
-                    last_text = block.text
-                    assistant_content.append({"type": "text", "text": block.text})
-                elif hasattr(block, "name"):  # ToolUseBlock
-                    tool_result = await context.mcp_registry.call_tool_by_name(
-                        block.name, block.input if isinstance(block.input, dict) else {}
-                    )
-                    assistant_content.append(block.model_dump())
-                    messages.append({
-                        "role": "user",
-                        "content": [{
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": json.dumps(tool_result, default=str),
-                        }],
-                    })
-
-            messages.append({"role": "assistant", "content": assistant_content})
-            kwargs["messages"] = messages
-
-        return last_text
-
-
-class EndpointAgent(Agent):
-    """Agent that calls an HTTP endpoint (OpenAI-compatible).
-
-    Usage:
-        agent = EndpointAgent(url="http://localhost:8000/v1/chat/completions")
-    """
-
-    def __init__(self, url: str, model: str = "default", timeout: float = 120.0):
-        self.url = url
-        self.model = model
-        self.timeout = timeout
-
-    async def run(self, query: str, context: Context) -> str:
-        import httpx
-
-        messages: list[dict[str, Any]] = []
-        if context.system_prompt:
-            messages.append({"role": "system", "content": context.system_prompt})
-        messages.append({"role": "user", "content": query})
-
-        body: dict[str, Any] = {"model": self.model, "messages": messages}
-        if context.tools:
-            body["tools"] = context.tools
-
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                self.url,
-                json=body,
-                timeout=self.timeout,
-            )
-            data = response.json()
-            return data.get("choices", [{}])[0].get("message", {}).get("content", "")
-
-
 def resolve_agent(
     agent: Agent | Callable | str | None = None,
     model: str = "gpt-4o",
@@ -388,10 +252,7 @@ def resolve_agent(
     Accepts:
     - Agent instance → returned as-is
     - Callable (async function) → wrapped in FunctionAgent
-    - String starting with "http" → EndpointAgent
-    - String starting with "anthropic:" → AnthropicAgent
     - String with api_key/base_url → OpenAIAgent
-    - None with agent_port → EndpointAgent on localhost
     """
     if isinstance(agent, Agent):
         return agent
@@ -400,16 +261,11 @@ def resolve_agent(
         return FunctionAgent(agent)
 
     if isinstance(agent, str):
-        if agent.startswith("http"):
-            return EndpointAgent(url=agent)
-        if agent.startswith("anthropic:"):
-            model = agent.split(":", 1)[1]
-            return AnthropicAgent(model=model, api_key=api_key, base_url=base_url)
-        # Assume it's a model name
+        if agent.startswith("http") or agent.startswith("anthropic:"):
+            raise ValueError("Pass existing HTTP/Anthropic agents through a wrapper function or integration adapter.")
         return OpenAIAgent(model=agent, api_key=api_key, base_url=base_url)
 
-    # Fallback: OpenAI agent with provided config
     if agent_port:
-        return EndpointAgent(url=f"http://localhost:{agent_port}/v1/chat/completions")
+        raise ValueError("agent_port is no longer a public shortcut. Pass an existing agent function or integration adapter.")
 
     return OpenAIAgent(model=model, api_key=api_key, base_url=base_url)

@@ -1,11 +1,10 @@
-"""Tools for TensorEval — Docker and MCP integration."""
+"""Tool integration helpers for TensorEval."""
 
-from tensoreval.tools.docker import DockerCompose
-from tensoreval.tools.mcp import MCPTool, MCPServer, MCPToolRegistry
+from tensoreval.tools.mcp import LocalTool, MCPTool, MCPServer, tool
 
 __all__ = [
-    "DockerCompose",
+    "LocalTool",
     "MCPTool",
     "MCPServer",
-    "MCPToolRegistry",
+    "tool",
 ]

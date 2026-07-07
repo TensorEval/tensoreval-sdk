@@ -2,7 +2,7 @@
 
 All graders implement the same interface:
 - `score(state) -> float` — score a single response
-- `score_group(states) -> list[float]` — score a group (for RULER/GRPO)
+- `score_group(states) -> list[float]` — score a group when a custom grader needs batching
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ class Grader:
     A grader takes a model response and returns a score between 0.0 and 1.0.
 
     Subclasses must override `score()`. Optionally override `score_group()`
-    for relative ranking (RULER-style).
+    when batch scoring is more efficient.
     """
 
     def __init__(self, grader_type: GraderType = GraderType.CUSTOM):
@@ -40,7 +40,7 @@ class Grader:
         raise NotImplementedError("Subclasses must implement score()")
 
     async def score_group(self, states: list[dict[str, Any]], **kwargs) -> list[float]:
-        """Score a group of responses (for RULER/GRPO).
+        """Score a group of responses.
 
         Default: call score() on each state individually.
         Override for relative ranking.

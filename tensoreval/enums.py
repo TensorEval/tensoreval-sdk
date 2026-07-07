@@ -45,9 +45,6 @@ class EnvType(str, Enum):
     ROBOT = "robot"
     """Robot control (action/observation loop). Agent controls a robot."""
 
-    VOICE = "voice"
-    """Voice/audio interaction. Agent processes audio input/output."""
-
     CLI_AGENT = "cli_agent"
     """Agent code in sandboxes with API interception."""
 
@@ -67,9 +64,6 @@ class Modality(str, Enum):
     IMAGE = "image"
     """Image input (screenshots, photos, diagrams)."""
 
-    AUDIO = "audio"
-    """Audio input/output (speech, sounds)."""
-
     VIDEO = "video"
     """Video input (camera feeds, screen recordings)."""
 
@@ -77,7 +71,7 @@ class Modality(str, Enum):
     """Document input (PDF, Word, Excel)."""
 
     MULTIMODAL = "multimodal"
-    """Multiple modalities combined (text + image + audio)."""
+    """Multiple modalities combined."""
 
     CODE = "code"
     """Code input/output (Python, JavaScript, etc.)."""
@@ -97,9 +91,6 @@ class GraderType(str, Enum):
 
     AGENT = "agent"
     """LLM-as-judge scoring. Uses another model to judge responses."""
-
-    RULER = "ruler"
-    """Zero-config relative ranking via LLM. No rubrics needed."""
 
     EXACT_MATCH = "exact_match"
     """Exact string match against reference answer."""

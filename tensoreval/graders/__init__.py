@@ -1,14 +1,7 @@
-"""Graders for TensorEval evaluation.
-
-Grader types:
-- RubricGrader: LLM-judged rubric scoring (or simple matching)
-- AgentGrader: Multi-rubric LLM-as-judge
-- RulerGrader: Zero-config relative ranking
-"""
+"""Graders for TensorEval evaluation."""
 
 from tensoreval.graders.base import Grader
-from tensoreval.graders.rubric_grader import RubricGrader
-from tensoreval.graders.agent_grader import AgentGrader
-from tensoreval.graders.ruler_grader import RulerGrader
+from tensoreval.graders.agent_grader import AgentGrader, VercelAgentGrader
+from tensoreval.graders.verification_grader import VerificationGrader
 
-__all__ = ["Grader", "RubricGrader", "AgentGrader", "RulerGrader"]
+__all__ = ["Grader", "AgentGrader", "VercelAgentGrader", "VerificationGrader"]

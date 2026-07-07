@@ -8,8 +8,7 @@ Tests are organized by module:
 5. Evaluation — full pipeline (with mock agent)
 6. Env — environment config
 7. Tools — Docker compose YAML generation
-8. Metrics — voice metrics computation
-9. Utils — parsing helpers
+8. Utils — parsing helpers
 """
 
 import asyncio
@@ -113,6 +112,16 @@ def test_datasets():
     assert len(ds3[0].rubrics) == 2
     assert ds3[0].rubrics[0].name == "policy"
 
+    # Top-level scenario metadata is preserved for dashboard grouping.
+    ds_category = te.Datasets.load_from_dict([{
+        "query": "Handle duplicate charge",
+        "reference_answer": "Refund duplicate charge",
+        "category": "billing",
+        "difficulty": "easy",
+    }])
+    assert ds_category[0].metadata["category"] == "billing"
+    assert ds_category[0].metadata["difficulty"] == "easy"
+
     # Iteration
     for sample in ds:
         assert sample.input != ""
@@ -151,12 +160,12 @@ def test_datasets():
 # 3. GRADERS (no API calls)
 # ===========================================================================
 
-def test_rubric_grader_simple():
-    """Test RubricGrader in simple mode (no API calls)."""
+def test_agent_grader_fallback():
+    """Test AgentGrader deterministic fallback path (no Gateway call required)."""
     import tensoreval as te
 
     async def run():
-        grader = te.RubricGrader(simple=True)
+        grader = te.AgentGrader(fallback_on_error=True)
 
         # Exact match
         score = await grader.score({
@@ -195,81 +204,18 @@ def test_rubric_grader_simple():
         assert score4 == 0.0
 
     asyncio.run(run())
-    print("  rubric_grader_simple: PASS")
+    print("  agent_grader_fallback: PASS")
 
 
-def test_rubric_grader_llm_fallback():
-    """Test RubricGrader falls back to simple when no rubrics."""
+def test_vercel_agent_grader_export():
+    """Test the VercelAgentGrader public export and alias."""
     import tensoreval as te
 
-    async def run():
-        # With model configured but no rubrics → falls back to simple
-        grader = te.RubricGrader(
-            model="test-model",
-            api_key="test-key",
-            base_url="http://test",
-        )
-        score = await grader.score({
-            "query": "What is 2+2?",
-            "completion": [{"role": "assistant", "content": "4"}],
-            "answer": "4",
-            "info": {"rubrics": []},
-        })
-        assert score == 1.0
+    grader = te.VercelAgentGrader(model="openai/gpt-5.5", fallback_on_error=True)
+    assert isinstance(grader, te.AgentGrader)
+    assert grader.model == "openai/gpt-5.5"
 
-    asyncio.run(run())
-    print("  rubric_grader_llm_fallback: PASS")
-
-
-def test_ruler_grader_single():
-    """Test RulerGrader single-sample scoring."""
-    import tensoreval as te
-
-    async def run():
-        grader = te.RulerGrader(model="test", api_key="test", base_url="http://test")
-
-        # With answer match
-        score = await grader.score({
-            "query": "What is 2+2?",
-            "completion": [{"role": "assistant", "content": "The answer is 4."}],
-            "answer": "4",
-            "info": {},
-        })
-        assert score >= 0.5  # Should get reasonable heuristic score
-
-        # Empty response
-        score2 = await grader.score({
-            "query": "test",
-            "completion": [],
-            "answer": "test",
-            "info": {},
-        })
-        assert score2 == 0.0
-
-    asyncio.run(run())
-    print("  ruler_grader_single: PASS")
-
-
-def test_ruler_grader_group():
-    """Test RulerGrader group scoring (fallback)."""
-    import tensoreval as te
-
-    async def run():
-        grader = te.RulerGrader(model="test", api_key="test", base_url="http://test")
-
-        # Single item in group → returns 0.5
-        scores = await grader.score_group([{
-            "completion": [{"role": "assistant", "content": "test"}],
-            "answer": "test",
-        }])
-        assert scores == [0.5]
-
-        # Empty group
-        scores2 = await grader.score_group([])
-        assert scores2 == []
-
-    asyncio.run(run())
-    print("  ruler_grader_group: PASS")
+    print("  vercel_agent_grader_export: PASS")
 
 
 def test_grader_base():
@@ -335,13 +281,19 @@ def test_agents():
     agent5 = resolve_agent(agent2)
     assert agent5 is agent2
 
-    # resolve_agent with http URL → EndpointAgent
-    agent6 = resolve_agent("http://localhost:8000")
-    assert isinstance(agent6, te.EndpointAgent)
+    # resolve_agent with http URL → raises (need wrapper function)
+    try:
+        resolve_agent("http://localhost:8000")
+        assert False, "Should have raised"
+    except ValueError:
+        pass
 
-    # resolve_agent with anthropic: prefix → AnthropicAgent
-    agent7 = resolve_agent("anthropic:mimo-v2.5-pro", api_key="key", base_url="url")
-    assert isinstance(agent7, te.AnthropicAgent)
+    # resolve_agent with anthropic: prefix → raises (need wrapper function)
+    try:
+        resolve_agent("anthropic:mimo-v2.5-pro", api_key="key", base_url="url")
+        assert False, "Should have raised"
+    except ValueError:
+        pass
 
     print("  agents: PASS")
 
@@ -368,7 +320,7 @@ def test_evaluation_with_function_agent():
         {"query": "What is the speed of light?", "reference_answer": "299792458"},
     ])
 
-    grader = te.RubricGrader(simple=True)
+    grader = te.AgentGrader(fallback_on_error=True)
     results = te.Evaluation.run(ds, grader, agent=mock_agent)
 
     assert len(results.runs) == 3
@@ -399,7 +351,7 @@ def test_evaluation_with_agent_class():
         {"query": "What is 2+2?", "reference_answer": "4"},
     ])
 
-    results = te.Evaluation.run(ds, te.RubricGrader(simple=True), agent=MathAgent())
+    results = te.Evaluation.run(ds, te.AgentGrader(fallback_on_error=True), agent=MathAgent())
     assert results.runs[0].reward == 1.0
 
     print("  evaluation_agent_class: PASS")
@@ -471,7 +423,7 @@ def test_evaluation_observability_traces():
 
     try:
         ds = te.Datasets.load_from_dict([{"query": "What is 2+2?", "reference_answer": "4"}])
-        results = te.Evaluation.run(ds, te.RubricGrader(simple=True), agent=mock_agent, model="gpt-4o")
+        results = te.Evaluation.run(ds, te.AgentGrader(fallback_on_error=True), agent=mock_agent, model="gpt-4o")
     finally:
         te.set_tracer(previous_tracer)
 
@@ -490,7 +442,7 @@ def test_evaluation_observability_traces():
 
 
 # ===========================================================================
-# 6. ENV
+# 6. ENVIRONMENT
 # ===========================================================================
 
 def test_env():
@@ -498,55 +450,67 @@ def test_env():
     import tensoreval as te
 
     # Simple env
-    env = te.Env.from_dict({"system_prompt": "You are helpful."})
+    env = te.Environment(system_prompt="You are helpful.")
     assert env.system_prompt == "You are helpful."
+    assert te.Environment is te.Environment
 
     # With Docker config
-    env2 = te.Env.from_dict({
-        "system_prompt": "test",
-        "agent": {"image": "python:3.12", "port": 8000},
-        "mcp": {"image": "node:18", "port": 9000},
-    })
+    env2 = te.Environment(
+        system_prompt="test",
+        agent={"image": "python:3.12", "port": 8000},
+        mcp={"image": "node:18", "port": 9000},
+    )
     assert env2.agent is not None
     assert env2.mcp is not None
 
     # With direct URLs
-    env3 = te.Env.from_dict({
-        "system_prompt": "test",
-        "agent_url": "http://localhost:8000",
-        "mcp_url": "http://localhost:9000/mcp",
-    })
+    env3 = te.Environment(
+        system_prompt="test",
+        agent_url="http://localhost:8000",
+        mcp_url="http://localhost:9000/mcp",
+    )
     assert env3.agent_url == "http://localhost:8000"
+
+    # Multiple MCP servers
+    env4 = te.Environment(
+        mcp_servers=[
+            "http://localhost:9000/mcp",
+            {"name": "crm", "url": "http://localhost:9001/mcp"},
+        ],
+        mcp_port=8001,
+    )
+    assert len(env4.mcp_servers) == 2
+    assert env4.mcp_port == 8001
 
     print("  env: PASS")
 
 
 # ===========================================================================
-# 7. TOOLS — Docker Compose
+# 7. ENVIRONMENT — Docker Compose
 # ===========================================================================
 
 def test_docker_compose_yaml():
-    """Test Docker Compose YAML generation."""
+    """Test Environment Docker Compose YAML generation."""
     import tensoreval as te
 
-    compose = te.DockerCompose(services={
-        "agent": {
+    env = te.Environment(
+        agent={
             "image": "python:3.12-slim",
             "port": 8000,
             "command": "python /app/agent.py",
             "env": {"API_KEY": "secret"},
         },
-        "mcp": {
+        mcp={
             "image": "node:18-slim",
             "port": 9000,
         },
-    })
+    )
 
-    yaml = compose._generate_compose_yaml()
+    yaml = env.to_compose_yaml()
 
     assert "services:" in yaml
     assert "agent:" in yaml
-    assert "mcp:" in yaml
+    assert "mcp-server:" in yaml
     assert "python:3.12-slim" in yaml
     assert "127.0.0.1:8000:8000" in yaml
     assert "127.0.0.1:9000:9000" in yaml
@@ -557,91 +521,22 @@ def test_docker_compose_yaml():
 
 
 def test_docker_compose_urls():
-    """Test Docker Compose URL helpers."""
+    """Test Environment URL helpers."""
     import tensoreval as te
 
-    compose = te.DockerCompose(services={
-        "agent": {"image": "python:3.12", "port": 8000},
-        "mcp-server": {"image": "node:18", "port": 9000},
-    })
+    env = te.Environment(
+        agent={"image": "python:3.12", "port": 8000},
+        mcp={"image": "node:18", "port": 9000},
+    )
 
-    assert compose.get_agent_url() == "http://localhost:8000"
-    assert compose.get_mcp_url() == "http://localhost:9000/mcp"
+    assert env.get_agent_url() == "http://localhost:8000"
+    assert env.get_mcp_url() == "http://localhost:9000/mcp"
 
     print("  docker_compose_urls: PASS")
 
 
 # ===========================================================================
-# 8. METRICS — Voice
-# ===========================================================================
-
-def test_voice_metrics():
-    """Test voice metrics computation."""
-    from tensoreval.metrics.voice import VoiceMetrics
-
-    vm = VoiceMetrics()
-
-    # WER — exact match
-    transcript = [{"role": "assistant", "content": "the cat sat on the mat"}]
-    wer = vm._compute_wer(transcript, reference="the cat sat on the mat")
-    assert wer == 0.0
-
-    # WER — one word wrong
-    wer2 = vm._compute_wer(transcript, reference="the dog sat on the mat")
-    assert wer2 > 0.0
-    assert wer2 < 1.0
-
-    # WER — no reference
-    wer3 = vm._compute_wer(transcript, reference="")
-    assert wer3 == 0.0
-
-    # TTFT
-    transcript2 = [
-        {"role": "user", "content": "hello", "start_time": 0, "end_time": 1.0},
-        {"role": "assistant", "content": "hi", "start_time": 1.5, "end_time": 2.0},
-    ]
-    ttft = vm._compute_ttft(transcript2)
-    assert ttft == 0.5  # 1.5 - 1.0
-
-    # Talk ratio
-    ratio = vm._compute_talk_ratio(transcript2)
-    assert 0 < ratio < 1
-
-    # Interruptions
-    transcript3 = [
-        {"role": "user", "content": "hello", "start_time": 0, "end_time": 2.0},
-        {"role": "assistant", "content": "hi", "start_time": 1.5, "end_time": 3.0},  # Interrupts
-    ]
-    interruptions = vm._compute_interruptions(transcript3)
-    assert interruptions == 1
-
-    # WPM
-    wpm = vm._compute_wpm(transcript2)
-    assert wpm > 0
-
-    print("  voice_metrics: PASS")
-
-
-def test_indian_language_metrics():
-    """Test Indian language metrics."""
-    from tensoreval.metrics.voice import IndianLanguageMetrics
-
-    ilm = IndianLanguageMetrics()
-
-    # Code-switching detection
-    transcript = [{"role": "assistant", "content": "Main aapko नमस्ते कहता हूँ"}]
-    cs = ilm._detect_code_switching(transcript)
-    assert cs == 1.0  # Detected (Latin + Devanagari)
-
-    transcript2 = [{"role": "assistant", "content": "Hello world"}]
-    cs2 = ilm._detect_code_switching(transcript2)
-    assert cs2 == 0.0  # Not detected (Latin only)
-
-    print("  indian_language_metrics: PASS")
-
-
-# ===========================================================================
-# 9. UTILS — Parsing
+# 8. UTILS — Parsing
 # ===========================================================================
 
 def test_utils_parsing():
@@ -666,13 +561,13 @@ def test_utils_parsing():
 
 def test_mcp_tools():
     """Test MCP tool classes."""
-    import tensoreval as te
+    from tensoreval.tools.mcp import MCPServer, MCPToolRegistry
 
-    server = te.MCPServer(url="http://localhost:9000/mcp", name="test-server")
+    server = MCPServer(url="http://localhost:9000/mcp", name="test-server")
     assert server.name == "test-server"
     assert server.url == "http://localhost:9000/mcp"
 
-    registry = te.MCPToolRegistry()
+    registry = MCPToolRegistry()
     registry.add_server("my_server", server)
     assert "my_server" in registry.servers
 
@@ -692,13 +587,13 @@ def test_mcp_tools():
 
 def test_mcp_call_by_name():
     """Test MCPToolRegistry.call_tool_by_name for unknown tools."""
-    import tensoreval as te
+    from tensoreval.tools.mcp import MCPServer, MCPToolRegistry
 
-    registry = te.MCPToolRegistry()
+    registry = MCPToolRegistry()
     result = asyncio.run(registry.call_tool_by_name("nonexistent", {}))
     assert "error" in result
 
-    server = te.MCPServer(url="http://localhost:9000/mcp")
+    server = MCPServer(url="http://localhost:9000/mcp")
     registry.add_server("srv", server)
     result = asyncio.run(registry.call_tool_by_name("missing_tool", {}))
     assert "error" in result
@@ -707,9 +602,12 @@ def test_mcp_call_by_name():
 
 
 def test_env_docker_import_fixed():
-    """Verify Env Docker import points to tools.docker (not deleted docker_compose)."""
+    """Verify internal Docker import points to tools.docker (not deleted docker_compose)."""
     import tensoreval.tools.docker as docker_mod
+    import tensoreval as te
+
     assert hasattr(docker_mod, "DockerCompose")
+    assert not hasattr(te, "DockerCompose")
 
     try:
         import tensoreval.docker_compose
@@ -721,18 +619,52 @@ def test_env_docker_import_fixed():
 
 
 def test_env_agent_url_port_extraction():
-    """Test that Env.agent_url port extraction works."""
+    """Test that Environment URL port extraction works."""
     import tensoreval as te
 
-    env = te.Env.from_dict({"agent_url": "http://localhost:8000"})
+    env = te.Environment(agent_url="http://localhost:8000")
     port = int(env.agent_url.rsplit(":", 1)[-1].split("/")[0])
     assert port == 8000
 
-    env2 = te.Env.from_dict({"mcp_url": "http://localhost:9000/mcp"})
+    env2 = te.Environment(mcp_url="http://localhost:9000/mcp")
     mcp_port = int(env2.mcp_url.rsplit(":", 1)[-1].split("/")[0])
     assert mcp_port == 9000
 
     print("  env_agent_url_port_extraction: PASS")
+
+
+def test_eval_starts_mcp_only_env():
+    """Test evaluation starts Env when only an MCP Docker service is configured."""
+    from tensoreval.evaluation import Evaluation
+    import tensoreval as te
+
+    class FakeEnv:
+        system_prompt = None
+        agent_url = None
+        mcp_url = "http://localhost:9000/mcp"
+        mcp_servers = []
+        tools = []
+        agent = None
+        mcp = {"image": "node:18", "port": 9000}
+        started = False
+
+        async def start(self):
+            self.started = True
+
+        async def stop(self):
+            pass
+
+    async def agent(query: str) -> str:
+        return "4"
+
+    env = FakeEnv()
+    ds = te.Datasets.load_from_dict([{"query": "2+2", "reference_answer": "4"}])
+    results = te.Evaluation.run(ds, te.AgentGrader(fallback_on_error=True), agent=agent, env=env)
+
+    assert env.started is True
+    assert results.runs[0].reward == 1.0
+
+    print("  eval_starts_mcp_only_env: PASS")
 
 
 def test_openai_agent_tool_loop_config():
@@ -766,7 +698,7 @@ def test_evaluation_mcp_tools_in_context():
     fake_tools = [{"type": "function", "function": {"name": "lookup", "parameters": {}}}]
 
     asyncio.run(_evaluate_single(
-        0, ds, te.RubricGrader(simple=True), CaptureAgent(),
+        0, ds, te.AgentGrader(fallback_on_error=True), CaptureAgent(),
         te.EvalConfig(model="test"),
         mcp_tools=fake_tools,
         mcp_registry="fake_registry",
@@ -776,6 +708,183 @@ def test_evaluation_mcp_tools_in_context():
     assert captured["has_registry"] is True
 
     print("  evaluation_mcp_tools_in_context: PASS")
+
+
+def test_tool_registry_local_tools_and_mcp_servers():
+    """Test local Python tools and multiple MCP servers normalize into one registry."""
+    import tensoreval as te
+    from tensoreval.evaluation import _build_tool_registry
+
+    def lookup_order(order_id: str) -> dict:
+        """Look up an order by ID."""
+        return {"order_id": order_id, "status": "shipped"}
+
+    def count_items(items: list[str], metadata: dict | None = None) -> int:
+        """Count item IDs."""
+        return len(items) + (1 if metadata else 0)
+
+    env = te.Environment(
+        mcp_servers=[
+            "http://localhost:9000/mcp",
+            {"name": "crm", "url": "http://localhost:9001/mcp"},
+        ]
+    )
+    config = te.EvalConfig(tools=[lookup_order, count_items], mcp_port=8001)
+    registry = _build_tool_registry(config, env)
+
+    assert registry is not None
+    assert "lookup_order" in registry.local_tools
+    assert len(registry.servers) == 3
+
+    tools = registry.to_openai_tools()
+    assert tools[0]["function"]["name"] == "lookup_order"
+    assert tools[0]["function"]["parameters"]["required"] == ["order_id"]
+    assert tools[1]["function"]["parameters"]["properties"]["items"]["type"] == "array"
+    assert tools[1]["function"]["parameters"]["properties"]["metadata"]["type"] == "object"
+
+    result = asyncio.run(registry.call_tool_by_name("lookup_order", {"order_id": "O-1"}))
+    assert result == {"order_id": "O-1", "status": "shipped"}
+
+    print("  tool_registry_local_tools_and_mcp_servers: PASS")
+
+
+def test_vercel_grader_tool_helpers():
+    """Test grader-side Responses tool conversion and execution helpers."""
+    import tensoreval as te
+    from tensoreval.tools.mcp import MCPToolRegistry
+    from tensoreval.graders.agent_grader import (
+        _execute_grader_tool_call,
+        _json_schema_unsupported,
+        _response_function_calls,
+        _responses_text_format,
+        _to_responses_tools,
+    )
+
+    def check_policy(topic: str) -> str:
+        """Check policy text."""
+        return f"policy for {topic}"
+
+    registry = MCPToolRegistry()
+    registry.add_local_tool(check_policy)
+    openai_tools = registry.to_openai_tools()
+    response_tools = _to_responses_tools(openai_tools, True, "low")
+
+    assert response_tools[0] == {"type": "web_search", "search_context_size": "low"}
+    assert response_tools[1]["type"] == "function"
+    assert response_tools[1]["name"] == "check_policy"
+
+    class FakeResponse:
+        output = [{
+            "type": "function_call",
+            "name": "check_policy",
+            "call_id": "call_1",
+            "arguments": '{"topic":"refunds"}',
+        }]
+
+    calls = _response_function_calls(FakeResponse())
+    assert calls == [{"name": "check_policy", "call_id": "call_1", "arguments": {"topic": "refunds"}}]
+
+    result = asyncio.run(_execute_grader_tool_call(calls[0], registry))
+    assert result == "policy for refunds"
+
+    err = Exception("text.format type 'json_schema' is not supported, only 'text' and 'json_object' are allowed")
+    assert _json_schema_unsupported(err) is True
+    assert _responses_text_format("json_object") == {"format": {"type": "json_object"}}
+
+    @te.tool(name="decorated_policy", description="Decorated policy checker")
+    def decorated(topic: str) -> str:
+        return topic
+
+    registry2 = MCPToolRegistry()
+    registry2.add_local_tool(decorated)
+    decorated_tool = registry2.to_openai_tools()[0]["function"]
+    assert decorated_tool["name"] == "decorated_policy"
+    assert decorated_tool["description"] == "Decorated policy checker"
+
+    @te.tool
+    def bare_decorated(topic: str) -> str:
+        return topic
+
+    registry3 = MCPToolRegistry()
+    registry3.add_local_tool(bare_decorated)
+    assert registry3.to_openai_tools()[0]["function"]["name"] == "bare_decorated"
+
+    print("  vercel_grader_tool_helpers: PASS")
+
+
+def test_langchain_integration_wrap_agent():
+    """Test wrapping an existing LangChain-style runnable without LangChain installed."""
+    import tensoreval as te
+    from tensoreval.agents import Context
+
+    class FakeRunnable:
+        async def ainvoke(self, payload, config=None):
+            for cb in (config or {}).get("callbacks", []):
+                cb.on_tool_start({"name": "lookup"}, "order=O-1", run_id="tool-1")
+                cb.on_tool_end("shipped", run_id="tool-1")
+            return {"output": f"handled {payload['input']}"}
+
+    async def run():
+        agent = te.integrations.langchain.wrap_agent(FakeRunnable())
+        context = Context(query="refund")
+        result = await agent.run("refund", context)
+        assert result == "handled refund"
+        assert context.metadata["tool_trace"] == [{"tool": "lookup", "args": "order=O-1", "result": "shipped"}]
+
+    asyncio.run(run())
+
+    print("  langchain_integration_wrap_agent: PASS")
+
+
+def test_verification_grader():
+    """Test VerificationGrader with a mocked OpenAI chat completion."""
+    import tensoreval as te
+    from tensoreval.graders import verification_grader as vg
+
+    grader = te.VerificationGrader(
+        model="test-model",
+        api_key="test-key",
+        base_url="http://localhost:9999/v1",
+        fallback_on_error=False,
+    )
+
+    class FakeMessage:
+        content = '{"rubric_scores": [{"rubric_name": "correctness", "score": 1.0, "weight": 1.0, "reasoning": "verified"}], "grader_reasoning": "ok"}'
+
+    class FakeChoice:
+        message = FakeMessage()
+
+    class FakeResult:
+        choices = [FakeChoice()]
+
+    async def fake_create(**kwargs):
+        return FakeResult()
+
+    original_create = vg.AsyncOpenAI
+    vg.AsyncOpenAI = lambda **kw: type("FakeClient", (), {"chat": type("FakeChat", (), {"completions": type("FakeCompletions", (), {"create": staticmethod(fake_create)})})})()
+    try:
+        async def run():
+            state = {
+                "query": "What is 2+2?",
+                "answer": "4",
+                "completion": [{"role": "assistant", "content": "4"}],
+                "info": {
+                    "rubrics": [{"name": "correctness", "criteria": "Must be 4", "weight": 1.0}],
+                    "tool_trace": [],
+                    "mcp_tools": [],
+                },
+                "tools": [],
+                "tool_registry": None,
+            }
+            score = await grader.score(state)
+            assert score == 1.0
+            assert state["grader_result"]["passed"] is True
+
+        asyncio.run(run())
+    finally:
+        vg.AsyncOpenAI = original_create
+
+    print("  verification_grader: PASS")
 
 
 # ===========================================================================
@@ -791,10 +900,8 @@ def run_all():
     tests = [
         test_types,
         test_datasets,
-        test_rubric_grader_simple,
-        test_rubric_grader_llm_fallback,
-        test_ruler_grader_single,
-        test_ruler_grader_group,
+        test_agent_grader_fallback,
+        test_vercel_agent_grader_export,
         test_grader_base,
         test_agents,
         test_evaluation_with_function_agent,
@@ -805,15 +912,18 @@ def run_all():
         test_env,
         test_docker_compose_yaml,
         test_docker_compose_urls,
-        test_voice_metrics,
-        test_indian_language_metrics,
         test_utils_parsing,
         test_mcp_tools,
         test_mcp_call_by_name,
         test_env_docker_import_fixed,
         test_env_agent_url_port_extraction,
+        test_eval_starts_mcp_only_env,
         test_openai_agent_tool_loop_config,
         test_evaluation_mcp_tools_in_context,
+        test_tool_registry_local_tools_and_mcp_servers,
+        test_vercel_grader_tool_helpers,
+        test_langchain_integration_wrap_agent,
+        test_verification_grader,
     ]
 
     passed = 0

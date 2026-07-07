@@ -103,6 +103,9 @@ class EvaluationResult:
                     "reward": r.reward,
                     "latency_ms": r.latency_ms,
                     "error": r.error,
+                    "grader_result": r.metadata.get("grader_result") if r.metadata else None,
+                    "tool_trace": r.metadata.get("tool_trace", []) if r.metadata else [],
+                    "metadata": {k: v for k, v in (r.metadata or {}).items() if k not in ("grader_result", "tool_trace")} if r.metadata else {},
                 }
                 for r in self.runs
             ],
@@ -154,6 +157,11 @@ class EvaluationResult:
                 reward=r.get("reward", 0.0),
                 latency_ms=r.get("latency_ms", 0.0),
                 error=r.get("error"),
+                metadata={
+                    "grader_result": r.get("grader_result"),
+                    "tool_trace": r.get("tool_trace", []),
+                    **{k: v for k, v in r.get("metadata", {}).items() if k not in ("grader_result", "tool_trace")},
+                },
             )
             for r in data.get("runs", [])
         ]
@@ -198,7 +206,7 @@ class Evaluation:
 
         Args:
             dataset: Samples with queries, answers, rubrics.
-            grader: Scorer (default: RubricGrader).
+            grader: Scorer (default: AgentGrader).
             agent: Agent to evaluate. Can be:
                 - Agent instance
                 - async function (query: str) -> str
@@ -213,6 +221,8 @@ class Evaluation:
         """
         from tensoreval.agents import Agent, Context, resolve_agent
 
+        run_name = kwargs.get("experiment_name") or getattr(dataset, "name", "") or None
+
         # Build config
         if config is None:
             config = EvalConfig(**{k: v for k, v in kwargs.items() if k in EvalConfig.__dataclass_fields__})
@@ -225,6 +235,12 @@ class Evaluation:
         if env is not None:
             if config.system_prompt is None:
                 config.system_prompt = env.system_prompt
+            if not config.tools and getattr(env, "tools", None):
+                config.tools = list(env.tools)
+            if not config.mcp_servers and getattr(env, "mcp_servers", None):
+                config.mcp_servers = list(env.mcp_servers)
+            if config.mcp_port is None and getattr(env, "mcp_port", None):
+                config.mcp_port = env.mcp_port
             # Extract agent port from env.agent_url if not explicitly set
             if config.agent_port is None and env.agent_url:
                 try:
@@ -260,20 +276,10 @@ class Evaluation:
             agent_port=config.agent_port,
         )
 
-        # Default grader: AgentGrader (LLM-as-judge) when model config exists,
-        # RubricGrader (simple match) as offline fallback
+        # Default grader: Vercel AI Gateway judge with deterministic offline fallback.
         if grader is None:
-            if config.api_key and config.api_key != "":
-                from tensoreval.graders.agent_grader import AgentGrader
-                grader = AgentGrader(
-                    model=config.model,
-                    api_key=config.api_key,
-                    base_url=config.base_url,
-                    fallback_on_error=True,
-                )
-            else:
-                from tensoreval.graders.rubric_grader import RubricGrader
-                grader = RubricGrader(simple=True)
+            from tensoreval.graders.agent_grader import AgentGrader
+            grader = AgentGrader(fallback_on_error=True)
 
         from tensoreval.observability import current_run, get_tracer
 
@@ -289,7 +295,7 @@ class Evaluation:
 
         # Start Docker if needed
         env_started = False
-        if env is not None and hasattr(env, 'start') and hasattr(env, 'agent') and env.agent:
+        if env is not None and hasattr(env, 'start') and (getattr(env, 'agent', None) or getattr(env, 'mcp', None)):
             try:
                 await env.start()
                 env_started = True
@@ -297,27 +303,40 @@ class Evaluation:
                 import sys
                 print(f"[tensoreval] warning: env.start() failed: {e}", file=sys.stderr)
 
-        # Build MCP tool registry from env or config
-        mcp_registry = None
-        mcp_url = None
-        if env is not None and getattr(env, 'mcp_url', None):
-            mcp_url = env.mcp_url
-        elif config.mcp_port:
-            mcp_url = f"http://localhost:{config.mcp_port}/mcp"
-
-        if mcp_url:
-            from tensoreval.tools.mcp import MCPServer, MCPToolRegistry
-            mcp_registry = MCPToolRegistry()
-            mcp_registry.add_server("default", MCPServer(url=mcp_url))
+        # Build one tool registry from local Python tools plus optional MCP servers.
+        mcp_registry = _build_tool_registry(config, env)
+        platform_client = None
+        live_run_id = None
+        if os.environ.get("TENSOREVAL_API_KEY"):
+            platform_client, live_run_id = _start_live_dashboard_run(config, len(dataset), name=run_name)
 
         try:
-            results = await _run_eval(dataset, grader, resolved_agent, config, mcp_registry)
+            results = await _run_eval(
+                dataset,
+                grader,
+                resolved_agent,
+                config,
+                mcp_registry,
+                platform_client=platform_client,
+                live_run_id=live_run_id,
+            )
             if trace_run is not None:
                 trace_run.set_summary(status="ok", **results.summary().to_dict())
-            # Push to TensorEval backend if an API key is configured
-            _maybe_push_to_backend(results, trace_run)
+            if platform_client and live_run_id:
+                try:
+                    platform_client.complete_evaluation(live_run_id, results.summary().to_dict())
+                except Exception:
+                    pass
+            else:
+                # Push to TensorEval backend if an API key is configured
+                _maybe_push_to_backend(results, trace_run)
             return results
         except Exception as e:
+            if platform_client and live_run_id:
+                try:
+                    platform_client.complete_evaluation(live_run_id, failed=True, progress=str(e))
+                except Exception:
+                    pass
             if trace_run is not None:
                 trace_run.set_summary(status="error", error=str(e))
             raise
@@ -343,7 +362,7 @@ class Evaluation:
 
         Args:
             dataset: Samples with queries, answers, rubrics.
-            grader: Scorer (default: RubricGrader).
+            grader: Scorer (default: AgentGrader).
             agent: Agent to evaluate (see run_async for options).
             env: Env config.
             config: Evaluation configuration.
@@ -375,16 +394,18 @@ async def _run_eval(
     agent: Any,
     config: EvalConfig,
     mcp_registry: Any = None,
+    platform_client: Any = None,
+    live_run_id: str | None = None,
 ) -> EvaluationResult:
     """Internal: run the evaluation loop.
 
-    If the grader supports ``score_group`` (e.g. RulerGrader) and there are
-    multiple samples, responses are collected first then batch-ranked for
-    relative scoring. Otherwise each sample is scored individually.
+    If a custom grader overrides ``score_group`` and there are multiple samples,
+    responses are collected first then batch-scored. Otherwise each sample is
+    scored individually.
     """
     sem = asyncio.Semaphore(config.workers)
 
-    # Pre-fetch MCP tools once (non-fatal if server is down)
+    # Pre-fetch tools once (non-fatal if an optional MCP server is down)
     mcp_tools: list[dict[str, Any]] = []
     if mcp_registry:
         try:
@@ -393,7 +414,9 @@ async def _run_eval(
         except Exception:
             pass
 
-    use_group_scoring = hasattr(grader, "score_group") and len(dataset) > 1
+    base_score_group = getattr(Grader, "score_group", None)
+    grader_score_group = getattr(type(grader), "score_group", None)
+    use_group_scoring = grader_score_group is not base_score_group and len(dataset) > 1
 
     if use_group_scoring:
         # Phase 1: collect all responses in parallel
@@ -421,12 +444,24 @@ async def _run_eval(
             )
             for i in range(len(dataset))
         ]
+        if platform_client and live_run_id:
+            for run in runs:
+                try:
+                    await asyncio.to_thread(platform_client.append_evaluation_result, live_run_id, run, len(dataset))
+                except Exception:
+                    pass
         return EvaluationResult(runs, dataset, config)
 
     # Standard per-sample scoring
     async def eval_one(idx: int) -> Run:
         async with sem:
-            return await _evaluate_single(idx, dataset, grader, agent, config, mcp_tools, mcp_registry)
+            run = await _evaluate_single(idx, dataset, grader, agent, config, mcp_tools, mcp_registry)
+            if platform_client and live_run_id:
+                try:
+                    await asyncio.to_thread(platform_client.append_evaluation_result, live_run_id, run, len(dataset))
+                except Exception:
+                    pass
+            return run
 
     tasks = [eval_one(i) for i in range(len(dataset))]
     runs = await asyncio.gather(*tasks)
@@ -462,7 +497,12 @@ async def _collect_response(
         "query": sample.input,
         "answer": sample.target,
         "completion": [{"role": "assistant", "content": response}],
-        "info": {"rubrics": [{"name": r.name, "criteria": r.criteria, "weight": r.weight} for r in sample.rubrics]},
+        "info": {
+            "rubrics": [{"name": r.name, "criteria": r.criteria, "weight": r.weight} for r in sample.rubrics],
+            "mcp_tools": mcp_tools or [],
+        },
+        "tools": mcp_tools or [],
+        "tool_registry": mcp_registry,
         "prompt": [{"role": "user", "content": sample.input}],
         "index": idx,
     }
@@ -508,13 +548,21 @@ async def _evaluate_single(
         # Get response from agent
         response = await call_agent(input_text=sample.input, model=config.model)
         latency_ms = (time.monotonic() - start_time) * 1000
+        tool_trace = context.metadata.get("tool_trace", [])
 
         # Build state for grader
+        sample_metadata = sample.metadata or {}
         state = {
             "query": sample.input,
             "answer": sample.target,
             "completion": [{"role": "assistant", "content": response}],
-            "info": {"rubrics": [{"name": r.name, "criteria": r.criteria, "weight": r.weight} for r in sample.rubrics]},
+            "info": {
+                "rubrics": [{"name": r.name, "criteria": r.criteria, "weight": r.weight} for r in sample.rubrics],
+                "mcp_tools": mcp_tools or [],
+                "tool_trace": tool_trace,
+            },
+            "tools": mcp_tools or [],
+            "tool_registry": mcp_registry,
             "prompt": [{"role": "user", "content": sample.input}],
             "index": idx,
         }
@@ -528,6 +576,11 @@ async def _evaluate_single(
             response=response,
             reward=reward,
             latency_ms=latency_ms,
+            metadata={
+                "grader_result": state.get("grader_result"),
+                "category": sample.metadata.get("category", "sdk") if sample.metadata else "sdk",
+                "tool_trace": tool_trace,
+            },
         )
 
     except Exception as e:
@@ -540,7 +593,75 @@ async def _evaluate_single(
             reward=0.0,
             latency_ms=latency_ms,
             error=str(e),
+            metadata={"category": sample.metadata.get("category", "sdk") if sample.metadata else "sdk"},
         )
+
+
+def _start_live_dashboard_run(config: EvalConfig, total_count: int, name: str | None = None) -> tuple[Any, str | None]:
+    """Start a live dashboard run when TensorEval backend credentials exist."""
+    import sys
+    from tensoreval.client import TensorEvalClient, TensorEvalError
+
+    try:
+        client = TensorEvalClient(timeout=3.0)
+        response = client.start_evaluation(model=config.model, total_count=total_count, name=name)
+        return client, response.get("evaluation_run_id")
+    except (TensorEvalError, Exception) as exc:
+        print(f"[tensoreval] live dashboard updates skipped: {exc}", file=sys.stderr)
+        return None, None
+
+
+def _build_tool_registry(config: EvalConfig, env: Any = None) -> Any:
+    """Build a registry for local Python tools and optional MCP servers."""
+    from tensoreval.tools.mcp import MCPServer, MCPToolRegistry
+
+    registry = MCPToolRegistry()
+
+    for tool in config.tools or []:
+        if callable(tool):
+            registry.add_local_tool(tool)
+
+    server_specs: list[Any] = []
+    if config.mcp_servers:
+        server_specs.extend(config.mcp_servers if isinstance(config.mcp_servers, list) else [config.mcp_servers])
+    if env is not None and getattr(env, "mcp_servers", None):
+        server_specs.extend(env.mcp_servers if isinstance(env.mcp_servers, list) else [env.mcp_servers])
+    if env is not None and getattr(env, "mcp_url", None):
+        server_specs.append({"name": "default", "url": env.mcp_url})
+    if config.mcp_port:
+        server_specs.append({"name": "default", "url": f"http://localhost:{config.mcp_port}/mcp"})
+
+    seen_urls: set[str] = set()
+    for idx, spec in enumerate(server_specs):
+        server = _mcp_server_from_spec(spec, idx)
+        if not server or not server.url or server.url in seen_urls:
+            continue
+        seen_urls.add(server.url)
+        registry.add_server(server.name or f"server_{idx + 1}", server)
+
+    if registry.local_tools or registry.servers:
+        return registry
+    return None
+
+
+def _mcp_server_from_spec(spec: Any, idx: int) -> Any:
+    from tensoreval.tools.mcp import MCPServer
+
+    if isinstance(spec, MCPServer):
+        return spec
+    if isinstance(spec, str):
+        return MCPServer(url=spec, name=f"server_{idx + 1}")
+    if isinstance(spec, dict):
+        url = str(spec.get("url") or spec.get("mcp_url") or "")
+        if not url:
+            return None
+        return MCPServer(
+            url=url,
+            name=str(spec.get("name") or f"server_{idx + 1}"),
+            transport=str(spec.get("transport") or "streamable-http"),
+            auth_token=spec.get("auth_token") or spec.get("token"),
+        )
+    return None
 
 
 def _maybe_push_to_backend(results: EvaluationResult, trace_run: Any) -> None:
