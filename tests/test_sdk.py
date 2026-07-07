@@ -887,6 +887,168 @@ def test_verification_grader():
     print("  verification_grader: PASS")
 
 
+def test_teval_result_coerce():
+    """Test TEvalResult.coerce normalizes various return types."""
+    import tensoreval as te
+
+    # From TEvalResult
+    r = te.TEvalResult(response="hi", tool_trace=[{"tool": "x"}])
+    assert te.TEvalResult.coerce(r) is r
+
+    # From str
+    r2 = te.TEvalResult.coerce("answer")
+    assert r2.response == "answer"
+    assert r2.tool_trace == []
+
+    # From dict
+    r3 = te.TEvalResult.coerce({"response": "ok", "tool_trace": [{"tool": "t"}]})
+    assert r3.response == "ok"
+    assert len(r3.tool_trace) == 1
+
+    # From None
+    r4 = te.TEvalResult.coerce(None)
+    assert r4.response == ""
+
+    print("  teval_result_coerce: PASS")
+
+
+def test_function_agent_with_teval_result():
+    """Test FunctionAgent correctly extracts tool_trace from TEvalResult."""
+    import tensoreval as te
+    from tensoreval.agents import FunctionAgent, Context
+
+    async def my_agent(query: str) -> te.TEvalResult:
+        return te.TEvalResult(
+            response="Refund approved",
+            tool_trace=[
+                {"tool": "lookup_order", "args": {"id": "O123"}, "result": {"ok": True}},
+            ],
+        )
+
+    agent = FunctionAgent(my_agent)
+    ctx = Context(query="test", metadata={})
+
+    async def run():
+        resp = await agent.run("test", ctx)
+        assert resp == "Refund approved"
+        assert len(ctx.metadata["tool_trace"]) == 1
+        assert ctx.metadata["tool_trace"][0]["tool"] == "lookup_order"
+
+    asyncio.run(run())
+    print("  function_agent_with_teval_result: PASS")
+
+
+def test_mcp_verify_registry():
+    """Test MCPRegistry discovers tools from a mocked server."""
+    from tensoreval.graders.mcp_verify import MCPRegistry
+    import tensoreval.graders.mcp_verify as mv
+
+    def fake_post_json(url, body, headers=None, timeout=30):
+        if body.get("method") == "tools/list":
+            return {"result": {"tools": [
+                {"name": "lookup_order", "description": "Look up order", "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}}},
+            ]}}
+        if body.get("method") == "tools/call":
+            return {"result": {"status": "delivered"}}
+        return {}
+
+    original = mv._post_json
+    mv._post_json = fake_post_json
+    try:
+        reg = MCPRegistry(["http://localhost:9000/mcp"], timeout=5)
+        tools = reg.discover()
+        assert len(tools) == 1
+        assert tools[0].name == "lookup_order"
+
+        openai_tools = reg.to_openai_tools()
+        assert openai_tools[0]["function"]["name"] == "lookup_order"
+
+        result = reg.call("lookup_order", {"id": "O123"})
+        assert result["status"] == "delivered"
+    finally:
+        mv._post_json = original
+
+    print("  mcp_verify_registry: PASS")
+
+
+def test_verification_grader_with_mcp_verify():
+    """Test VerificationGrader active verification with mocked MCP + LLM."""
+    import tensoreval as te
+    from tensoreval.graders import verification_grader as vg
+    from tensoreval.graders import mcp_verify as mv
+
+    grader = te.VerificationGrader(
+        model="test-model",
+        api_key="test-key",
+        base_url="http://localhost:9999/v1",
+        fallback_on_error=False,
+        max_verify_turns=3,
+    )
+
+    # Mock the OpenAI client for read phase
+    class FakeMessage:
+        content = '{"rubric_scores": [{"rubric_name": "correctness", "score": 0.8, "weight": 1.0, "reasoning": "looks ok"}], "grader_reasoning": "initial read"}'
+
+    class FakeChoice:
+        message = FakeMessage()
+
+    class FakeResult:
+        choices = [FakeChoice()]
+
+    async def fake_create(**kwargs):
+        return FakeResult()
+
+    # Mock MCP + LLM for verify phase
+    def fake_post_json(url, body, headers=None, timeout=30):
+        if body.get("method") == "tools/list":
+            return {"result": {"tools": [
+                {"name": "check_status", "description": "Check order status", "inputSchema": {"type": "object", "properties": {"id": {"type": "string"}}}},
+            ]}}
+        if body.get("method") == "tools/call":
+            return {"result": {"status": "refunded"}}
+        # LLM call in verify loop
+        messages = body.get("messages", [])
+        has_tool_result = any(m.get("role") == "tool" for m in messages)
+        if has_tool_result:
+            return {"choices": [{"message": {"content": '{"rubric_scores": [{"rubric_name": "correctness", "score": 1.0, "weight": 1.0, "reasoning": "verified with tool"}], "grader_reasoning": "verified"}'}}]}
+        # First verify call — return a tool call
+        return {"choices": [{"message": {
+            "content": "",
+            "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "check_status", "arguments": '{"id":"O123"}'}}],
+        }}]}
+
+    original_openai = vg.AsyncOpenAI
+    original_post = mv._post_json
+    vg.AsyncOpenAI = lambda **kw: type("FC", (), {"chat": type("FC2", (), {"completions": type("FC3", (), {"create": staticmethod(fake_create)})})})()
+    mv._post_json = fake_post_json
+    try:
+        async def run():
+            state = {
+                "query": "Refund O123",
+                "answer": "Refund processed",
+                "completion": [{"role": "assistant", "content": "Refund done"}],
+                "info": {
+                    "rubrics": [{"name": "correctness", "criteria": "Must refund", "weight": 1.0}],
+                    "tool_trace": [{"tool": "refund", "args": {"id": "O123"}, "result": {"ok": True}}],
+                    "mcp_tools": [],
+                },
+                "tools": [],
+                "tool_registry": None,
+            }
+            score = await grader.score(state, mcp_urls=["http://localhost:9000/mcp"])
+            assert score == 1.0
+            assert state["grader_result"]["passed"] is True
+            # Should have a grader_trace from the verify loop
+            assert "grader_trace" in state["grader_result"]
+
+        asyncio.run(run())
+    finally:
+        vg.AsyncOpenAI = original_openai
+        mv._post_json = original_post
+
+    print("  verification_grader_with_mcp_verify: PASS")
+
+
 # ===========================================================================
 # RUNNER
 # ===========================================================================
@@ -924,6 +1086,10 @@ def run_all():
         test_vercel_grader_tool_helpers,
         test_langchain_integration_wrap_agent,
         test_verification_grader,
+        test_teval_result_coerce,
+        test_function_agent_with_teval_result,
+        test_mcp_verify_registry,
+        test_verification_grader_with_mcp_verify,
     ]
 
     passed = 0

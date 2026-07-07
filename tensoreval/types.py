@@ -57,6 +57,50 @@ class Sample:
 
 
 @dataclass
+class TEvalResult:
+    """Structured return value from an agent callable.
+
+    The agent receives a query string and returns a ``TEvalResult``
+    containing the final response and an optional tool trace — the
+    list of tool calls the agent made while processing the query.
+
+    If the agent returns a plain ``str``, it is treated as a
+    ``TEvalResult(response=str, tool_trace=[])``.
+
+    Attributes:
+        response: The agent's final text response.
+        tool_trace: Optional list of tool call records. Each entry is a
+            dict with keys ``tool``, ``args``, and ``result``. The
+            customer is responsible for capturing this — the SDK does
+            not intercept tool calls inside the agent.
+    """
+
+    response: str = ""
+    tool_trace: list[dict[str, Any]] = field(default_factory=list)
+
+    @classmethod
+    def coerce(cls, value: Any) -> "TEvalResult":
+        """Normalize a return value into a TEvalResult.
+
+        Accepts:
+        - TEvalResult → returned as-is
+        - str → TEvalResult(response=str)
+        - dict with 'response' key → TEvalResult(**dict)
+        """
+        if isinstance(value, cls):
+            return value
+        if isinstance(value, str):
+            return cls(response=value)
+        if isinstance(value, dict) and "response" in value:
+            return cls(
+                response=str(value.get("response", "")),
+                tool_trace=list(value.get("tool_trace", [])),
+            )
+        # Fallback: stringify
+        return cls(response=str(value) if value is not None else "")
+
+
+@dataclass
 class Run:
     """Result of evaluating a single sample."""
 

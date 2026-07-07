@@ -2,28 +2,31 @@
 
 TensorEval supports multiple ways to bring your own agent:
 
-1. **Function** — simplest, just pass `async def my_agent(query) -> str`
+1. **Function** — simplest, just pass `async def my_agent(query) -> TEvalResult | str`
 2. **Agent class** — extend `Agent` for more control (tools, state, etc.)
 3. **OpenAI endpoint** — point at any OpenAI-compatible API
 
-Usage:
-    # Option 1: Function (simplest)
-    async def my_agent(query: str) -> str:
-        return await my_llm.call(query)
+The recommended approach is **Option 1** with a plain callable that
+returns a :class:`tensoreval.types.TEvalResult`:
+
+    async def my_agent(query: str) -> te.TEvalResult:
+        # Run your agent however you want — LangChain, CrewAI, raw HTTP
+        # Capture the tool trace yourself and return it
+        return te.TEvalResult(
+            response="Refund approved",
+            tool_trace=[
+                {"tool": "lookup_order", "args": {"id": "O123"}, "result": {"status": "ok"}},
+            ],
+        )
 
     results = Evaluation.run(dataset, grader, agent=my_agent)
 
-    # Option 2: Agent class (more control)
-    class MyAgent(Agent):
-        async def run(self, query: str, context: Context) -> str:
-            tools = context.tools
-            # ... custom logic ...
-            return response
+If you don't need tool trace evaluation, just return a string:
 
-    results = Evaluation.run(dataset, grader, agent=MyAgent())
+    async def my_agent(query: str) -> str:
+        return "answer"
 
-    # Option 3: OpenAI endpoint
-    results = Evaluation.run(dataset, grader, agent="http://localhost:8000")
+    results = Evaluation.run(dataset, grader, agent=my_agent)
 
 """
 
@@ -35,6 +38,8 @@ import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Awaitable
+
+from tensoreval.types import TEvalResult
 
 
 async def _call_with_rate_limit_retry(coro_factory, *, max_retries=3, base_delay=2.0):
@@ -112,18 +117,27 @@ class Agent(ABC):
 class FunctionAgent(Agent):
     """Wraps a simple async function as an Agent.
 
+    The function can return a ``TEvalResult``, a ``str``, or a ``dict``
+    with a ``response`` key. All are normalized via ``TEvalResult.coerce``.
+
     Usage:
-        async def my_agent(query: str) -> str:
-            return "answer"
+        async def my_agent(query: str) -> te.TEvalResult:
+            return te.TEvalResult(response="answer", tool_trace=[...])
 
         agent = FunctionAgent(my_agent)
     """
 
-    def __init__(self, fn: Callable[[str], Awaitable[str]]):
+    def __init__(self, fn: Callable[[str], Awaitable[Any]]):
         self.fn = fn
 
     async def run(self, query: str, context: Context) -> str:
-        return await self.fn(query)
+        result = await self.fn(query)
+        coerced = TEvalResult.coerce(result)
+        # Stash tool trace in context metadata for the grader
+        if coerced.tool_trace:
+            context.metadata.setdefault("tool_trace", [])
+            context.metadata["tool_trace"].extend(coerced.tool_trace)
+        return coerced.response
 
 
 class OpenAIAgent(Agent):

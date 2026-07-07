@@ -26,6 +26,7 @@ from tensoreval.types import (
     Run,
     EvalConfig,
     Summary,
+    TEvalResult,
     GraderType,
     Difficulty,
 )
@@ -82,7 +83,7 @@ __all__ = [
     "__version__",
     # Types
     "Rubric", "Sample", "Score", "Run", "EvalConfig", "Summary",
-    "GraderType", "Difficulty",
+    "TEvalResult", "GraderType", "Difficulty",
     # Core
     "Datasets", "Evaluation", "EvaluationResult",
     # Graders

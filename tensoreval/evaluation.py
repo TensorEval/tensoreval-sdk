@@ -542,8 +542,8 @@ async def _evaluate_single(
             return await agent.run(input_text, context)
 
         @observe("grader.score", kind="grader")
-        async def call_grader(input_text: str, model: str, state: dict[str, Any]) -> float:
-            return await grader.score(state)
+        async def call_grader(input_text: str, model: str, state: dict[str, Any], **kw: Any) -> float:
+            return await grader.score(state, **kw)
 
         # Get response from agent
         response = await call_agent(input_text=sample.input, model=config.model)
@@ -560,6 +560,8 @@ async def _evaluate_single(
                 "rubrics": [{"name": r.name, "criteria": r.criteria, "weight": r.weight} for r in sample.rubrics],
                 "mcp_tools": mcp_tools or [],
                 "tool_trace": tool_trace,
+                "difficulty": sample_metadata.get("difficulty", ""),
+                "attachments": sample_metadata.get("attachments", []),
             },
             "tools": mcp_tools or [],
             "tool_registry": mcp_registry,
@@ -567,7 +569,15 @@ async def _evaluate_single(
             "index": idx,
         }
 
-        reward = await call_grader(input_text=response, model=config.model, state=state)
+        # Pass MCP URLs to grader for active verification if available
+        mcp_urls = []
+        if hasattr(config, 'mcp_servers') and config.mcp_servers:
+            for s in config.mcp_servers:
+                url = getattr(s, 'url', None) or (s.get('url') if isinstance(s, dict) else None)
+                if url:
+                    mcp_urls.append(url)
+
+        reward = await call_grader(input_text=response, model=config.model, state=state, mcp_urls=mcp_urls)
 
         return Run(
             sample_id=sample.id,
