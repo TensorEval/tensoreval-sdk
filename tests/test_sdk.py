@@ -982,23 +982,10 @@ def test_verification_grader_with_mcp_verify():
         api_key="test-key",
         base_url="http://localhost:9999/v1",
         fallback_on_error=False,
-        max_verify_turns=3,
+        max_turns=3,
     )
 
-    # Mock the OpenAI client for read phase
-    class FakeMessage:
-        content = '{"rubric_scores": [{"rubric_name": "correctness", "score": 0.8, "weight": 1.0, "reasoning": "looks ok"}], "grader_reasoning": "initial read"}'
-
-    class FakeChoice:
-        message = FakeMessage()
-
-    class FakeResult:
-        choices = [FakeChoice()]
-
-    async def fake_create(**kwargs):
-        return FakeResult()
-
-    # Mock MCP + LLM for verify phase
+    # Mock MCP + LLM for tool loop (single phase — no separate read call)
     def fake_post_json(url, body, headers=None, timeout=30):
         if body.get("method") == "tools/list":
             return {"result": {"tools": [
@@ -1006,20 +993,18 @@ def test_verification_grader_with_mcp_verify():
             ]}}
         if body.get("method") == "tools/call":
             return {"result": {"status": "refunded"}}
-        # LLM call in verify loop
+        # LLM call in tool loop
         messages = body.get("messages", [])
         has_tool_result = any(m.get("role") == "tool" for m in messages)
         if has_tool_result:
             return {"choices": [{"message": {"content": '{"rubric_scores": [{"rubric_name": "correctness", "score": 1.0, "weight": 1.0, "reasoning": "verified with tool"}], "grader_reasoning": "verified"}'}}]}
-        # First verify call — return a tool call
+        # First call — return a tool call
         return {"choices": [{"message": {
             "content": "",
             "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "check_status", "arguments": '{"id":"O123"}'}}],
         }}]}
 
-    original_openai = vg.AsyncOpenAI
     original_post = mv._post_json
-    vg.AsyncOpenAI = lambda **kw: type("FC", (), {"chat": type("FC2", (), {"completions": type("FC3", (), {"create": staticmethod(fake_create)})})})()
     mv._post_json = fake_post_json
     try:
         async def run():
@@ -1038,12 +1023,11 @@ def test_verification_grader_with_mcp_verify():
             score = await grader.score(state, mcp_urls=["http://localhost:9000/mcp"])
             assert score == 1.0
             assert state["grader_result"]["passed"] is True
-            # Should have a grader_trace from the verify loop
+            # Should have a grader_trace from the tool loop
             assert "grader_trace" in state["grader_result"]
 
         asyncio.run(run())
     finally:
-        vg.AsyncOpenAI = original_openai
         mv._post_json = original_post
 
     print("  verification_grader_with_mcp_verify: PASS")

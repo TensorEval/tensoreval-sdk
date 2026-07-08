@@ -86,18 +86,19 @@ class Context:
 
 
 class Agent(ABC):
-    """Base class for agents.
+    """Base class for agents (deprecated — use a plain callable instead).
 
-    Extend this class and implement `run()` for full control over
-    how your agent processes queries.
+    .. deprecated::
+        Prefer passing a plain async callable that returns
+        :class:`tensoreval.types.TEvalResult` or ``str``::
 
-    Usage:
-        class MyAgent(Agent):
-            async def run(self, query: str, context: Context) -> str:
-                # Call your LLM, use tools, run custom logic, etc.
-                return response
+            async def my_agent(query: str) -> te.TEvalResult:
+                return te.TEvalResult(response="answer", tool_trace=[...])
 
-        results = Evaluation.run(dataset, grader, agent=MyAgent())
+            results = Evaluation.run(dataset, grader, agent=my_agent)
+
+        This class is kept for backward compatibility and will be removed
+        in a future version.
     """
 
     @abstractmethod

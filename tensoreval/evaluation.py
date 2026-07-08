@@ -560,7 +560,6 @@ async def _evaluate_single(
                 "rubrics": [{"name": r.name, "criteria": r.criteria, "weight": r.weight} for r in sample.rubrics],
                 "mcp_tools": mcp_tools or [],
                 "tool_trace": tool_trace,
-                "difficulty": sample_metadata.get("difficulty", ""),
                 "attachments": sample_metadata.get("attachments", []),
             },
             "tools": mcp_tools or [],
