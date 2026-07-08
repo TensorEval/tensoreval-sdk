@@ -27,7 +27,6 @@ Usage:
     )
 """
 
-from pathlib import Path
 from typing import Any, Callable
 
 
@@ -39,7 +38,6 @@ class Environment:
         system_prompt: str | None = None,
         tools: list[Callable] | None = None,
         docker_image: str | None = None,
-        dockerfile: str | None = None,
         compose_yaml: str | None = None,
         mcp_url: str | None = None,
         mcp_servers: list[Any] | None = None,
@@ -48,14 +46,12 @@ class Environment:
         mcp: dict[str, Any] | None = None,
         env_file: str | None = None,
         config: dict[str, Any] | None = None,
-        image: str | None = None,
         agent_port: int | None = None,
         mcp_port: int | None = None,
     ):
         self.system_prompt = system_prompt
         self.tools = tools or []
-        self.docker_image = docker_image or image
-        self.dockerfile = dockerfile
+        self.docker_image = docker_image
         self.compose_yaml = compose_yaml
         self.mcp_url = mcp_url
         self.mcp_servers = mcp_servers or []
@@ -66,76 +62,8 @@ class Environment:
         self.config = config or {}
         self.agent_port = agent_port
         self.mcp_port = mcp_port
-        self.image = image
         self._started = False
         self._compose = None
-
-    @classmethod
-    def load_from_file(cls, path: str | Path) -> "Environment":
-        """Load environment from YAML, JSON, or Python file."""
-        path = Path(path)
-        if not path.exists():
-            raise FileNotFoundError(f"File not found: {path}")
-
-        suffix = path.suffix.lower()
-        if suffix in (".yaml", ".yml"):
-            return cls._load_yaml(path)
-        elif suffix == ".json":
-            return cls._load_json(path)
-        elif suffix == ".py":
-            return cls._load_python(path)
-        else:
-            raise ValueError(f"Unsupported file type: {suffix}")
-
-    @classmethod
-    def from_dict(cls, config: dict[str, Any]) -> "Environment":
-        """Create from dict config. Prefer ``Environment(...)`` for new code."""
-        return cls(
-            system_prompt=config.get("system_prompt"),
-            tools=config.get("tools"),
-            docker_image=config.get("docker_image"),
-            dockerfile=config.get("dockerfile"),
-            compose_yaml=config.get("compose_yaml"),
-            mcp_url=config.get("mcp_url"),
-            mcp_servers=config.get("mcp_servers"),
-            agent_url=config.get("agent_url"),
-            agent=config.get("agent"),
-            mcp=config.get("mcp"),
-            env_file=config.get("env_file"),
-            image=config.get("image"),
-            agent_port=config.get("agent_port"),
-            mcp_port=config.get("mcp_port"),
-            config=config,
-        )
-
-    @classmethod
-    def _load_yaml(cls, path: Path) -> "Environment":
-        try:
-            import yaml
-        except ImportError:
-            raise ImportError("PyYAML required. Install: pip install pyyaml")
-        with open(path) as f:
-            return cls.from_dict(yaml.safe_load(f))
-
-    @classmethod
-    def _load_json(cls, path: Path) -> "Environment":
-        import json
-        with open(path) as f:
-            return cls.from_dict(json.load(f))
-
-    @classmethod
-    def _load_python(cls, path: Path) -> "Environment":
-        import importlib.util
-        spec = importlib.util.spec_from_file_location("env_module", path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        if hasattr(module, "load_environment"):
-            result = module.load_environment()
-            if isinstance(result, cls):
-                return result
-            elif isinstance(result, dict):
-                return cls.from_dict(result)
-        raise ValueError(f"Python file must define load_environment(): {path}")
 
     # ------------------------------------------------------------------
     # Docker lifecycle
@@ -158,9 +86,7 @@ class Environment:
         # Build Docker compose from config
         if self.agent or self.mcp:
             self._compose = self._build_compose()
-
             urls = await self._compose.up()
-
             if "agent" in urls:
                 self.agent_url = urls["agent"]
             if "mcp-server" in urls:
@@ -175,10 +101,6 @@ class Environment:
             await self._compose.down()
             self._compose = None
         self._started = False
-
-    def to_compose_yaml(self) -> str:
-        """Return Docker Compose YAML for this environment's Docker services."""
-        return self._build_compose()._generate_compose_yaml()
 
     def get_agent_url(self) -> str | None:
         """Get the configured or Docker-derived agent URL."""
@@ -195,24 +117,6 @@ class Environment:
         if self.mcp and "port" in self.mcp:
             return f"http://localhost:{self.mcp['port']}/mcp"
         return None
-
-    async def exec(self, service: str, cmd: list[str], timeout: int = 30) -> tuple[str, str, int]:
-        """Execute a command inside a running environment service container."""
-        if not self._compose:
-            raise RuntimeError("Environment not started. Call start() first.")
-        return await self._compose.exec(service, cmd, timeout=timeout)
-
-    async def write_file(self, service: str, path: str, contents: str | bytes) -> None:
-        """Write a file into a running environment service container."""
-        if not self._compose:
-            raise RuntimeError("Environment not started. Call start() first.")
-        await self._compose.write_file(service, path, contents)
-
-    async def read_file(self, service: str, path: str) -> str:
-        """Read a file from a running environment service container."""
-        if not self._compose:
-            raise RuntimeError("Environment not started. Call start() first.")
-        return await self._compose.read_file(service, path)
 
     def _build_compose(self):
         from tensoreval.tools.docker import DockerCompose

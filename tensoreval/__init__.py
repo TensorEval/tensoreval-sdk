@@ -28,7 +28,6 @@ from tensoreval.types import (
     Summary,
     TEvalResult,
     GraderType,
-    Difficulty,
 )
 
 # Dataset loading
@@ -55,9 +54,6 @@ from tensoreval.env import Environment
 # Tools
 from tensoreval.tools.mcp import LocalTool, MCPTool, MCPServer, tool
 
-# Optional integrations namespace (does not import optional dependencies)
-import tensoreval.integrations as integrations
-
 # Utilities
 from tensoreval.utils.data_utils import extract_boxed_answer, extract_hash_answer
 
@@ -83,7 +79,7 @@ __all__ = [
     "__version__",
     # Types
     "Rubric", "Sample", "Score", "Run", "EvalConfig", "Summary",
-    "TEvalResult", "GraderType", "Difficulty",
+    "TEvalResult", "GraderType",
     # Core
     "Datasets", "Evaluation", "EvaluationResult",
     # Graders
@@ -94,8 +90,6 @@ __all__ = [
     "Environment",
     # Tools
     "LocalTool", "MCPTool", "MCPServer", "tool",
-    # Integrations
-    "integrations",
     # Utilities
     "extract_boxed_answer", "extract_hash_answer",
     # Observability

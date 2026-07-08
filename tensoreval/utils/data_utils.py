@@ -5,9 +5,6 @@ Ported from PrimeIntellect Verifiers (MIT License).
 
 from typing import Any, Callable
 
-BOXED_SYSTEM_PROMPT = "Please reason step by step, and put your final answer within \\boxed{}."
-THINK_BOXED_SYSTEM_PROMPT = "Think step-by-step inside <think>...</think> tags. Then, give your final answer inside \\boxed{}."
-
 
 def extract_boxed_answer(text: str, strict: bool = False) -> str:
     """Extract the last \\boxed{...} answer from text.
