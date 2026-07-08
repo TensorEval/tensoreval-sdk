@@ -27,6 +27,7 @@ class EvaluationRun:
     reward: float
     passed: bool
     latency_ms: float
+    reference_answer: str = ""
     trace: dict[str, Any] | None = None
     grader_trace: dict[str, Any] | None = None
     rubric_scores: dict[str, Any] = field(default_factory=dict)
@@ -218,18 +219,30 @@ def _finish_dashboard(
 
 def _run_to_payload(run: EvaluationRun) -> dict[str, Any]:
     """Convert an EvaluationRun to the dashboard ingest API format."""
+    rubric_scores = [
+        {
+            "rubric_name": rid,
+            "score": data.get("score", 0) if isinstance(data, dict) else 0,
+            "reasoning": data.get("reason", "") if isinstance(data, dict) else "",
+            "weight": data.get("weight", 1.0) if isinstance(data, dict) else 1.0,
+        }
+        for rid, data in (run.rubric_scores or {}).items()
+    ]
     return {
         "sample_id": run.sample_id,
         "query": run.query,
+        "answer": run.reference_answer,
         "response": run.final_response,
         "reward": run.reward,
         "latency_ms": run.latency_ms,
         "error": run.error,
         "metadata": {
             "grader_result": {
-                "rubric_scores": run.rubric_scores,
+                "rubric_scores": rubric_scores,
                 "grader_reasoning": run.reasoning,
             },
+            "tool_trace": run.trace,
+            "grader_trace": run.grader_trace,
         },
     }
 
@@ -259,6 +272,7 @@ def _evaluate_sample(
             reward=grade["reward"],
             passed=grade["passed"],
             latency_ms=(time.monotonic() - started) * 1000,
+            reference_answer=sample.reference_answer,
             trace=trace,
             grader_trace=grade.get("grader_trace"),
             rubric_scores=grade["rubric_scores"],
@@ -272,6 +286,7 @@ def _evaluate_sample(
             reward=0.0,
             passed=False,
             latency_ms=(time.monotonic() - started) * 1000,
+            reference_answer=sample.reference_answer,
             error=str(exc),
         )
 
