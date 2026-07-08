@@ -11,7 +11,7 @@ import os
 import urllib.request
 from typing import Any
 
-DEFAULT_BASE_URL = "https://api.tensoreval.com"
+DEFAULT_BASE_URL = "http://localhost:4000"
 
 
 class DashboardClient:

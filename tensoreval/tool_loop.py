@@ -209,7 +209,10 @@ class ToolLoopAgent:
             "model": self.provider.model,
             "messages": [{"role": "system", "content": self.instructions}] + messages,
             "temperature": self.temperature,
+            "max_tokens": 2000,
         }
+        if not has_tools:
+            body["response_format"] = {"type": "json_object"}
         if has_tools:
             body["tools"] = registry.to_openai_tools()
             body["tool_choice"] = "auto"
@@ -254,9 +257,9 @@ class ToolLoopAgent:
         return {"content": content, "tool_calls": tool_calls}
 
 
-def _openai_tool_calls(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _openai_tool_calls(raw: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     calls = []
-    for call in raw:
+    for call in raw or []:
         function = call.get("function", {})
         try:
             arguments = json.loads(function.get("arguments") or "{}")
