@@ -209,7 +209,7 @@ class ToolLoopAgent:
             "model": self.provider.model,
             "messages": [{"role": "system", "content": self.instructions}] + messages,
             "temperature": self.temperature,
-            "max_tokens": 2000,
+            "max_tokens": 8000,
         }
         if not has_tools:
             body["response_format"] = {"type": "json_object"}
@@ -229,7 +229,7 @@ class ToolLoopAgent:
     def _complete_anthropic(self, messages: list[dict[str, Any]], registry: MCPRegistry, has_tools: bool) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": self.provider.model,
-            "max_tokens": 2000,
+            "max_tokens": 8000,
             "temperature": self.temperature,
             "system": self.instructions,
             "messages": _to_anthropic_messages(messages),
