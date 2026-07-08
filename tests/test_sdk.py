@@ -348,6 +348,93 @@ def test_dashboard_client_disabled_without_api_key():
             os.environ["TENSOREVAL_API_KEY"] = old_key
 
 
+def test_agent_result_coerce():
+    from tensoreval.types import AgentResult
+
+    # str → AgentResult with empty trace
+    r = AgentResult.coerce("hello")
+    assert r.response == "hello"
+    assert r.tool_trace == []
+
+    # AgentResult → as-is
+    r = AgentResult.coerce(AgentResult(response="hi", tool_trace=[{"name": "tool1"}]))
+    assert r.response == "hi"
+    assert r.tool_trace == [{"name": "tool1"}]
+
+    # dict → extract response + tool_trace
+    r = AgentResult.coerce({"response": "ok", "tool_trace": [{"name": "t"}]})
+    assert r.response == "ok"
+    assert r.tool_trace == [{"name": "t"}]
+
+    # dict with alternate keys
+    r = AgentResult.coerce({"content": "yes", "trace": [{"name": "t2"}]})
+    assert r.response == "yes"
+    assert r.tool_trace == [{"name": "t2"}]
+
+
+def test_evaluation_direct_callable_mode():
+    """Test Evaluation.run with a direct agent callable instead of an HTTP endpoint."""
+    import tensoreval as te
+
+    dataset = te.Dataset.from_dicts([
+        {"query": "What is 2+2?", "reference_answer": "4"},
+        {"query": "Capital of France?", "reference_answer": "Paris"},
+    ])
+
+    async def my_agent(query: str) -> str:
+        if "2+2" in query:
+            return "4"
+        return "London"  # wrong answer
+
+    grader = te.AgenticGrader(pass_threshold=0.8)
+    results = te.Evaluation.run(dataset=dataset, agent=my_agent, grader=grader, workers=2)
+
+    assert len(results.runs) == 2
+    assert results.runs[0].final_response == "4"
+    assert results.runs[1].final_response == "London"
+    assert results.runs[0].error is None
+    assert results.runs[1].error is None
+
+
+def test_evaluation_direct_callable_with_agent_result():
+    """Test direct callable returning AgentResult with tool_trace."""
+    import tensoreval as te
+
+    dataset = te.Dataset.from_dicts([
+        {"query": "Check order O123", "reference_answer": "Order found"},
+    ])
+
+    async def agent_with_trace(query: str) -> te.AgentResult:
+        return te.AgentResult(
+            response="Order O123 found, status: delivered",
+            tool_trace=[{"name": "lookup_order", "arguments": {"order_id": "O123"}, "result": {"status": "delivered"}}],
+        )
+
+    grader = te.AgenticGrader(pass_threshold=0.8)
+    results = te.Evaluation.run(dataset=dataset, agent=agent_with_trace, grader=grader)
+
+    assert len(results.runs) == 1
+    assert results.runs[0].final_response == "Order O123 found, status: delivered"
+    assert results.runs[0].trace is not None
+    assert results.runs[0].trace["steps"][0]["name"] == "lookup_order"
+
+
+def test_evaluation_rejects_both_env_and_agent():
+    import tensoreval as te
+
+    dataset = te.Dataset.from_dicts([{"query": "hi"}])
+    env = te.Env.from_endpoint(agent_url="http://localhost:8000")
+
+    async def my_agent(query: str) -> str:
+        return "hi"
+
+    try:
+        te.Evaluation.run(dataset=dataset, env=env, agent=my_agent)
+        assert False, "Should have raised"
+    except ValueError as exc:
+        assert "both" in str(exc).lower()
+
+
 def run_all():
     tests = [
         test_dataset_loads_jsonl_with_optional_rubrics_and_reference,
@@ -361,6 +448,10 @@ def run_all():
         test_result_save_load_roundtrip,
         test_sample_ids_are_stable_across_runs,
         test_dashboard_client_disabled_without_api_key,
+        test_agent_result_coerce,
+        test_evaluation_direct_callable_mode,
+        test_evaluation_direct_callable_with_agent_result,
+        test_evaluation_rejects_both_env_and_agent,
     ]
     failed = 0
     for test in tests:

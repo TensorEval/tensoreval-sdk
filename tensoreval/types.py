@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Awaitable, Callable, Union
 
 
 @dataclass(frozen=True)
@@ -56,3 +56,48 @@ class Sample:
     def __post_init__(self) -> None:
         if not self.id:
             self.id = f"case_{hashlib.md5(self.query.encode()).hexdigest()[:8]}"
+
+
+@dataclass
+class AgentResult:
+    """Structured return type from a direct agent callable.
+
+    Agents can return a plain ``str`` (just the response) or an
+    ``AgentResult`` (response + tool trace) from ``Evaluation.run``.
+
+    Attributes:
+        response: The agent's text response to the query.
+        tool_trace: List of tool calls the agent made, each as
+            ``{"name": "...", "arguments": {...}, "result": {...}}``.
+    """
+
+    response: str
+    tool_trace: list[dict[str, Any]] = field(default_factory=list)
+
+    @classmethod
+    def coerce(cls, raw: Any) -> "AgentResult":
+        """Normalize a raw agent return value into an AgentResult.
+
+        Accepts:
+        - ``AgentResult`` — returned as-is
+        - ``str`` — wrapped with empty tool_trace
+        - ``dict`` with ``"response"`` key — extracts response + tool_trace
+        """
+        if isinstance(raw, cls):
+            return raw
+        if isinstance(raw, str):
+            return cls(response=raw)
+        if isinstance(raw, dict):
+            return cls(
+                response=str(raw.get("response") or raw.get("content") or raw.get("output") or ""),
+                tool_trace=list(raw.get("tool_trace") or raw.get("trace") or []),
+            )
+        return cls(response=str(raw))
+
+
+# Type alias: an agent callable accepts a query string and returns
+# a string, AgentResult, or dict — either synchronously or asynchronously.
+AgentCallable = Callable[
+    [str],
+    Union[str, "AgentResult", dict[str, Any], Awaitable[Union[str, "AgentResult", dict[str, Any]]]],
+]

@@ -33,10 +33,12 @@ from tensoreval.errors import (
 )
 from tensoreval.evaluation import Evaluation, EvaluationResult, EvaluationRun
 from tensoreval.tool_loop import ProviderConfig
-from tensoreval.types import Rubric, Sample
+from tensoreval.types import AgentCallable, AgentResult, Rubric, Sample
 
 __all__ = [
     "__version__",
+    "AgentCallable",
+    "AgentResult",
     "AgenticGrader",
     "APIError",
     "AuthenticationError",

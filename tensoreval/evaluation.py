@@ -15,6 +15,7 @@ from tensoreval.agentic_grader import AgenticGrader
 from tensoreval.client import DashboardClient
 from tensoreval.dataset import Dataset
 from tensoreval.env import Env
+from tensoreval.types import AgentCallable, AgentResult
 
 
 @dataclass
@@ -133,34 +134,64 @@ class EvaluationResult:
 class Evaluation:
     """Entry point for running an evaluation.
 
-    Call ``Evaluation.run(dataset, env, grader)`` to evaluate an agent
-    across a dataset with concurrent workers and optional live dashboard updates.
+    Two modes:
+
+    **Direct callable** (no HTTP server needed)::
+
+        async def my_agent(query: str) -> str:
+            return call_your_model(query)
+
+        results = te.Evaluation.run(
+            dataset=dataset,
+            agent=my_agent,
+            grader=grader,
+            mcp_urls=["http://localhost:9000/mcp"],
+        )
+
+    **HTTP endpoint** (for deployed agents)::
+
+        env = te.Env.from_endpoint(agent_url="http://localhost:8000/v1/chat/completions")
+        results = te.Evaluation.run(dataset=dataset, env=env, grader=grader)
     """
 
     @staticmethod
     def run(
         dataset: Dataset,
-        env: Env,
+        env: Env | None = None,
         grader: AgenticGrader | None = None,
+        agent: AgentCallable | None = None,
+        mcp_urls: list[str] | None = None,
         workers: int = 1,
         timeout: float = 120.0,
         agent_config: dict[str, Any] | None = None,
     ) -> EvaluationResult:
-        if env.kind != "endpoint":
-            raise NotImplementedError(f"Environment kind '{env.kind}' is not supported — use Env.from_endpoint()")
+        if not env and not agent:
+            raise ValueError("Either 'env' (HTTP endpoint) or 'agent' (callable) must be provided")
+        if env and agent:
+            raise ValueError("Pass either 'env' or 'agent', not both")
 
         grader = grader or AgenticGrader()
         dashboard = DashboardClient()
-        dashboard_run_id = _start_dashboard(dashboard, env, len(dataset))
+
+        # Resolve MCP URLs and model name from whichever mode we're in
+        if env:
+            if env.kind != "endpoint":
+                raise NotImplementedError(f"Environment kind '{env.kind}' is not supported — use Env.from_endpoint()")
+            resolved_mcp_urls = env.mcp_urls
+            model_name = env.config.get("model", "default")
+        else:
+            resolved_mcp_urls = mcp_urls or []
+            model_name = "direct"
+
+        dashboard_run_id = _start_dashboard(dashboard, model_name, len(dataset))
 
         try:
             runs = asyncio.run(_grade_samples(
-                dataset, env, grader, timeout, agent_config or {}, workers, dashboard, dashboard_run_id,
+                dataset, env, agent, grader, timeout, agent_config or {},
+                workers, resolved_mcp_urls, dashboard, dashboard_run_id,
             ))
-            result = EvaluationResult(
-                runs=runs,
-                metadata={"env": {"kind": env.kind, "agent_url": env.agent_url, "mcp_urls": env.mcp_urls}},
-            )
+            metadata = {"env": {"kind": env.kind, "agent_url": env.agent_url, "mcp_urls": env.mcp_urls}} if env else {"mode": "direct", "mcp_urls": resolved_mcp_urls}
+            result = EvaluationResult(runs=runs, metadata=metadata)
             _finish_dashboard(dashboard, dashboard_run_id, result.summary())
             return result
         except Exception:
@@ -170,11 +201,13 @@ class Evaluation:
 
 async def _grade_samples(
     dataset: Dataset,
-    env: Env,
+    env: Env | None,
+    agent: AgentCallable | None,
     grader: AgenticGrader,
     timeout: float,
     agent_config: dict[str, Any],
     workers: int,
+    mcp_urls: list[str],
     dashboard: DashboardClient,
     dashboard_run_id: str | None,
 ) -> list[EvaluationRun]:
@@ -183,7 +216,9 @@ async def _grade_samples(
 
     async def grade_one(sample: Any) -> EvaluationRun:
         async with semaphore:
-            return await asyncio.to_thread(_evaluate_sample, sample, env, grader, timeout, agent_config)
+            if env:
+                return await asyncio.to_thread(_evaluate_sample_http, sample, env, grader, timeout, agent_config)
+            return await _evaluate_sample_direct(sample, agent, grader, mcp_urls, timeout)
 
     results: list[EvaluationRun] = []
     for coro in asyncio.as_completed([grade_one(s) for s in dataset]):
@@ -194,14 +229,14 @@ async def _grade_samples(
     return results
 
 
-def _start_dashboard(dashboard: DashboardClient, env: Env, total_count: int) -> str | None:
+def _start_dashboard(dashboard: DashboardClient, model_name: str, total_count: int) -> str | None:
     """Start a live evaluation run on the dashboard if enabled."""
     if not dashboard.enabled:
         return None
     return dashboard.start_evaluation(
-        model=env.config.get("model", "default"),
+        model=model_name,
         total_count=total_count,
-        name=f"SDK: {env.config.get('model', 'default')}",
+        name=f"SDK: {model_name}",
     )
 
 
@@ -234,14 +269,14 @@ def _run_to_payload(run: EvaluationRun) -> dict[str, Any]:
     }
 
 
-def _evaluate_sample(
+def _evaluate_sample_http(
     sample: Any,
     env: Env,
     grader: AgenticGrader,
     timeout: float,
     agent_config: dict[str, Any],
 ) -> EvaluationRun:
-    """Call the agent and grade its response for a single sample."""
+    """Call the agent HTTP endpoint and grade its response for a single sample."""
     started = time.monotonic()
     try:
         response = _post_json(
@@ -260,6 +295,49 @@ def _evaluate_sample(
             passed=grade["passed"],
             latency_ms=(time.monotonic() - started) * 1000,
             trace=trace,
+            grader_trace=grade.get("grader_trace"),
+            rubric_scores=grade["rubric_scores"],
+            reasoning=grade["reasoning"],
+        )
+    except Exception as exc:
+        return EvaluationRun(
+            sample_id=sample.id,
+            query=sample.query,
+            final_response="",
+            reward=0.0,
+            passed=False,
+            latency_ms=(time.monotonic() - started) * 1000,
+            error=str(exc),
+        )
+
+
+async def _evaluate_sample_direct(
+    sample: Any,
+    agent: AgentCallable,
+    grader: AgenticGrader,
+    mcp_urls: list[str],
+    timeout: float,
+) -> EvaluationRun:
+    """Call a direct agent callable and grade its response for a single sample."""
+    started = time.monotonic()
+    try:
+        raw = agent(sample.query)
+        if asyncio.iscoroutine(raw):
+            raw = await asyncio.wait_for(raw, timeout=timeout)
+        result = AgentResult.coerce(raw)
+
+        grade = grader.grade(
+            sample, result.response, agent_trace={"steps": result.tool_trace} if result.tool_trace else None,
+            mcp_urls=mcp_urls,
+        )
+        return EvaluationRun(
+            sample_id=sample.id,
+            query=sample.query,
+            final_response=result.response,
+            reward=grade["reward"],
+            passed=grade["passed"],
+            latency_ms=(time.monotonic() - started) * 1000,
+            trace={"steps": result.tool_trace} if result.tool_trace else None,
             grader_trace=grade.get("grader_trace"),
             rubric_scores=grade["rubric_scores"],
             reasoning=grade["reasoning"],
