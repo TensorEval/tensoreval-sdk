@@ -32,6 +32,10 @@ Thumbs.db
 # Examples (local demos, not part of the published package)
 examples/
 
+# Tests (local only, not published)
+tests/
+
 # Test results
 test_results.json
 customer_support_results.json
+fresh_eval_results.json
