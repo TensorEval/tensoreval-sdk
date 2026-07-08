@@ -25,12 +25,14 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
+import re
 import time
 import urllib.request
 import urllib.error
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable, get_args, get_origin
 
 
@@ -66,7 +68,7 @@ class LocalTool:
         self.name = meta.get("name") or getattr(fn, "__name__", "local_tool")
         doc = inspect.getdoc(fn) or ""
         self.description = meta.get("description") or (doc.splitlines()[0] if doc else f"Call {self.name}.")
-        self.parameters = _schema_from_callable(fn)
+        self.parameters = schema_from_callable(fn)
 
     async def call(self, arguments: dict[str, Any]) -> Any:
         result = self.fn(**arguments)
@@ -125,12 +127,15 @@ class MCPServer:
         """List available tools from the MCP server."""
         if self._tools is not None:
             return self._tools
+        return await asyncio.to_thread(self.discover_tools)
 
+    def discover_tools(self) -> list[MCPToolInfo]:
+        """Synchronously discover tools (urllib is sync anyway)."""
         try:
-            data = _post_json(self.url, {
+            data = post_json(self.url, {
                 "jsonrpc": "2.0", "id": 1,
                 "method": "tools/list", "params": {},
-            }, headers=self._headers(), timeout=self.timeout)
+            }, headers=self.headers(), timeout=self.timeout)
             tools_data = data.get("result", {}).get("tools", [])
             self._tools = [
                 MCPToolInfo(
@@ -143,26 +148,31 @@ class MCPServer:
             ]
             return self._tools
         except Exception:
+            self._tools = []
             return []
 
     async def call_tool(self, name: str, arguments: dict[str, Any]) -> Any:
         """Call a tool on the MCP server."""
+        return await asyncio.to_thread(self.call_tool_sync, name, arguments)
+
+    def call_tool_sync(self, name: str, arguments: dict[str, Any]) -> Any:
+        """Synchronously call a tool on the MCP server."""
         try:
-            data = _post_json(self.url, {
+            data = post_json(self.url, {
                 "jsonrpc": "2.0", "id": 1,
                 "method": "tools/call",
                 "params": {"name": name, "arguments": arguments},
-            }, headers=self._headers(), timeout=self.timeout)
+            }, headers=self.headers(), timeout=self.timeout)
             result = data.get("result", {})
             return result.get("content", result)
         except Exception as exc:
             return {"error": str(exc)}
 
-    def _headers(self) -> dict[str, str]:
-        headers: dict[str, str] = {}
+    def headers(self) -> dict[str, str]:
+        result: dict[str, str] = {}
         if self.auth_token:
-            headers["Authorization"] = f"Bearer {self.auth_token}"
-        return headers
+            result["Authorization"] = f"Bearer {self.auth_token}"
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +209,12 @@ class MCPRegistry:
             all_tools.extend(tools)
         return all_tools
 
+    def discover_all_tools_sync(self) -> None:
+        """Synchronously discover tools from all servers (populates cache)."""
+        for server in self.servers.values():
+            if server._tools is None:
+                server.discover_tools()
+
     def to_openai_tools(self) -> list[dict[str, Any]]:
         """Convert all tools to OpenAI function-tool format."""
         tools = [t.to_openai_tool() for t in self.local_tools.values()]
@@ -225,6 +241,33 @@ class MCPRegistry:
                     if tool_info.name == name:
                         return await server.call_tool(name, arguments)
         return {"error": f"Tool not found: {name}"}
+
+    def call_tool_by_name_sync(self, name: str, arguments: dict[str, Any]) -> Any:
+        """Synchronously find and call a tool by name."""
+        if name in self.local_tools:
+            tool_obj = self.local_tools[name]
+            result = tool_obj.fn(**arguments)
+            if inspect.isawaitable(result):
+                # Best effort — try to run the coroutine
+                try:
+                    loop = asyncio.get_event_loop()
+                    if loop.is_running():
+                        return {"error": "Cannot await async local tool from sync context"}
+                    return asyncio.run(await_result(result))
+                except RuntimeError:
+                    return asyncio.run(await_result(result))
+            return result
+        for server in self.servers.values():
+            if server._tools:
+                for tool_info in server._tools:
+                    if tool_info.name == name:
+                        return server.call_tool_sync(name, arguments)
+        return {"error": f"Tool not found: {name}"}
+
+
+async def await_result(coro: Any) -> Any:
+    """Await a coroutine (helper for sync-to-async bridge)."""
+    return await coro
 
 
 # ---------------------------------------------------------------------------
@@ -256,20 +299,7 @@ def run_verification_loop(
     """
     registry = MCPRegistry(mcp_urls, timeout=timeout)
     if mcp_urls:
-        # Discover tools synchronously (urllib is sync)
-        for server in registry.servers.values():
-            # list_tools is async but uses urllib internally — run it
-            import asyncio
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # We're inside an async context — can't use asyncio.run
-                    # Fall back to direct sync discovery
-                    _sync_discover_tools(server)
-                else:
-                    asyncio.run(server.list_tools())
-            except RuntimeError:
-                _sync_discover_tools(server)
+        registry.discover_all_tools_sync()
 
     openai_tools = registry.to_openai_tools()
 
@@ -290,7 +320,7 @@ def run_verification_loop(
             body["tool_choice"] = "auto"
 
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        data = _post_json(
+        data = post_json(
             f"{base_url.rstrip('/')}/chat/completions",
             body, headers=headers, timeout=timeout,
         )
@@ -301,7 +331,7 @@ def run_verification_loop(
 
         if not tool_calls:
             trace.append({"type": "final", "turn": turn, "content": content[:500]})
-            return {"content": content, "grader_trace": trace, "parsed": _try_parse_json(content)}
+            return {"content": content, "grader_trace": trace, "parsed": try_parse_json(content)}
 
         messages.append({
             "role": "assistant",
@@ -328,7 +358,7 @@ def run_verification_loop(
                 args = {}
 
             started = time.monotonic()
-            result = _sync_call_tool(registry, name, args)
+            result = registry.call_tool_by_name_sync(name, args)
             duration_ms = (time.monotonic() - started) * 1000
 
             trace.append({
@@ -354,76 +384,11 @@ def run_verification_loop(
     }
 
 
-def _sync_discover_tools(server: MCPServer) -> None:
-    """Synchronously discover tools (urllib is sync anyway)."""
-    try:
-        data = _post_json(server.url, {
-            "jsonrpc": "2.0", "id": 1,
-            "method": "tools/list", "params": {},
-        }, headers=server._headers(), timeout=server.timeout)
-        tools_data = data.get("result", {}).get("tools", [])
-        server._tools = [
-            MCPToolInfo(
-                server_url=server.url,
-                name=t.get("name", ""),
-                description=t.get("description", ""),
-                parameters=t.get("inputSchema", {"type": "object", "properties": {}}),
-            )
-            for t in tools_data
-        ]
-    except Exception:
-        server._tools = []
-
-
-def _sync_call_tool(registry: MCPRegistry, name: str, args: dict[str, Any]) -> Any:
-    """Synchronously call a tool by name (urllib is sync anyway)."""
-    if name in registry.local_tools:
-        # Local tools may be async — best effort
-        tool_obj = registry.local_tools[name]
-        result = tool_obj.fn(**args)
-        if inspect.isawaitable(result):
-            # Can't await without a loop — return the coroutine's result via asyncio
-            import asyncio
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    return {"error": "Cannot await async local tool from sync context"}
-                return asyncio.run(_await_result(result))
-            except RuntimeError:
-                return asyncio.run(_await_result(result))
-        return result
-
-    for server in registry.servers.values():
-        if server._tools:
-            for tool_info in server._tools:
-                if tool_info.name == name:
-                    return server.call_tool.__wrapped__ if hasattr(server.call_tool, "__wrapped__") else _sync_mcp_call(server, name, args)
-    return {"error": f"Tool not found: {name}"}
-
-
-def _sync_mcp_call(server: MCPServer, name: str, args: dict[str, Any]) -> Any:
-    """Synchronous MCP tool call."""
-    try:
-        data = _post_json(server.url, {
-            "jsonrpc": "2.0", "id": 1,
-            "method": "tools/call",
-            "params": {"name": name, "arguments": args},
-        }, headers=server._headers(), timeout=server.timeout)
-        result = data.get("result", {})
-        return result.get("content", result)
-    except Exception as exc:
-        return {"error": str(exc)}
-
-
-async def _await_result(coro: Any) -> Any:
-    return await coro
-
-
 # ---------------------------------------------------------------------------
 # HTTP + JSON helpers (stdlib only)
 # ---------------------------------------------------------------------------
 
-def _post_json(
+def post_json(
     url: str,
     body: dict[str, Any],
     headers: dict[str, str] | None = None,
@@ -439,10 +404,8 @@ def _post_json(
         return json.loads(resp.read().decode("utf-8"))
 
 
-def _try_parse_json(text: str) -> dict[str, Any] | None:
+def try_parse_json(text: str) -> dict[str, Any] | None:
     """Try to extract and parse a JSON object from text."""
-    import re
-
     try:
         return json.loads(text)
     except (json.JSONDecodeError, TypeError):
@@ -469,7 +432,7 @@ def _try_parse_json(text: str) -> dict[str, Any] | None:
 # Schema inference for local tools
 # ---------------------------------------------------------------------------
 
-def _schema_from_callable(fn: Callable[..., Any]) -> dict[str, Any]:
+def schema_from_callable(fn: Callable[..., Any]) -> dict[str, Any]:
     """Build a minimal JSON Schema from a Python callable signature."""
     signature = inspect.signature(fn)
     properties: dict[str, Any] = {}
@@ -478,7 +441,7 @@ def _schema_from_callable(fn: Callable[..., Any]) -> dict[str, Any]:
     for name, param in signature.parameters.items():
         if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
             continue
-        properties[name] = {"type": _json_type(param.annotation)}
+        properties[name] = {"type": json_type(param.annotation)}
         if param.default is inspect.Parameter.empty:
             required.append(name)
 
@@ -488,7 +451,8 @@ def _schema_from_callable(fn: Callable[..., Any]) -> dict[str, Any]:
     return schema
 
 
-def _json_type(annotation: Any) -> str:
+def json_type(annotation: Any) -> str:
+    """Map a Python type annotation to a JSON Schema type string."""
     if annotation is inspect.Parameter.empty:
         return "string"
     origin = get_origin(annotation)
@@ -499,7 +463,7 @@ def _json_type(annotation: Any) -> str:
             return "object"
         args = [arg for arg in get_args(annotation) if arg is not type(None)]
         if args:
-            return _json_type(args[0])
+            return json_type(args[0])
     if annotation is str:
         return "string"
     if annotation is bool:

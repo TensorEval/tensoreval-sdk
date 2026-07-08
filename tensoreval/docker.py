@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import tempfile
 import uuid
@@ -48,7 +49,7 @@ class DockerCompose:
         self._compose_path: str | None = None
         self._is_up = False
 
-    def _generate_compose_yaml(self) -> str:
+    def generate_compose_yaml(self) -> str:
         lines = ["services:"]
         for name, config in self.services.items():
             lines.append(f"  {name}:")
@@ -94,7 +95,7 @@ class DockerCompose:
 
         self._tmpdir = tempfile.mkdtemp(prefix="tensoreval-compose-")
         self._compose_path = os.path.join(self._tmpdir, "compose.yaml")
-        compose_content = self._generate_compose_yaml()
+        compose_content = self.generate_compose_yaml()
 
         if self.env_file:
             for name in self.services:
@@ -183,7 +184,6 @@ class DockerCompose:
 
     async def write_file(self, service: str, path: str, contents: str | bytes) -> None:
         """Write a file into a container."""
-        import base64
         if isinstance(contents, str):
             contents = contents.encode()
         b64 = base64.b64encode(contents).decode()

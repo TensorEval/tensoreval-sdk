@@ -9,8 +9,9 @@ Two modes:
    When ``mcp_urls`` are passed to ``score()``, the judge can call the
    agent's own MCP tools to independently verify claims before scoring.
 
-Both modes use the OpenAI Chat Completions API (any OpenAI-compatible
-endpoint works — Vercel AI Gateway, OpenAI, Azure, local vLLM, etc.).
+Both modes use the OpenAI Chat Completions API via raw ``urllib`` —
+no external SDK dependencies. Any OpenAI-compatible endpoint works
+(Vercel AI Gateway, OpenAI, Azure, local vLLM, etc.).
 
 Usage:
     from tensoreval import Grader
@@ -30,6 +31,8 @@ import asyncio
 import json
 import os
 import re
+import urllib.request
+import urllib.error
 from typing import Any
 
 
@@ -84,41 +87,41 @@ class Grader:
         """
         completion = state.get("completion", [])
         answer = str(state.get("answer", ""))
-        query_text = _extract_query(state)
-        response = _extract_response(completion)
+        query_text = extract_query(state)
+        response = extract_response(completion)
 
         if not completion:
             return 0.0
 
         raw_rubrics = state.get("info", {}).get("rubrics", [])
-        rubrics = _normalize_rubrics(raw_rubrics, answer)
+        rubrics = normalize_rubrics(raw_rubrics, answer)
         tool_trace = state.get("info", {}).get("tool_trace", [])
         attachments = state.get("info", {}).get("attachments", [])
         mcp_urls = kwargs.get("mcp_urls") or []
 
         if self.fallback_on_error and not raw_rubrics:
-            score = _simple_score(answer, response)
-            self.last_result = _fallback_result(rubrics, score, "no rubrics provided")
+            score = simple_score(answer, response)
+            self.last_result = fallback_result(rubrics, score, "no rubrics provided")
             state["grader_result"] = self.last_result
             return score
 
         try:
             if mcp_urls:
-                result = await self._score_with_mcp(
+                result = await self.score_with_mcp(
                     query_text, answer, response, rubrics, tool_trace, attachments, mcp_urls,
                 )
             else:
-                result = await self._score_direct(
+                result = await self.score_direct(
                     query_text, answer, response, rubrics, tool_trace, attachments,
                 )
-            normalized = _normalize_eval_result(result, rubrics)
+            normalized = normalize_eval_result(result, rubrics)
             self.last_result = normalized
             state["grader_result"] = normalized
             return float(normalized["weighted_score"])
         except Exception as exc:
             if self.fallback_on_error:
-                score = _simple_score(answer, response)
-                self.last_result = _fallback_result(rubrics, score, str(exc))
+                score = simple_score(answer, response)
+                self.last_result = fallback_result(rubrics, score, str(exc))
                 state["grader_result"] = self.last_result
                 return score
             raise RuntimeError(f"Grader failed: {exc}") from exc
@@ -127,7 +130,7 @@ class Grader:
     # Mode 1: Direct LLM call
     # ------------------------------------------------------------------
 
-    async def _score_direct(
+    async def score_direct(
         self,
         query_text: str,
         answer: str,
@@ -137,36 +140,35 @@ class Grader:
         attachments: list[dict[str, Any]],
     ) -> dict[str, Any]:
         """Single LLM call — judge reads trace and scores."""
-        from openai import AsyncOpenAI
+        system_prompt = build_system_prompt(rubrics, bool(answer), attachments)
+        user_prompt = build_user_prompt(query_text, answer, response, rubrics, tool_trace, attachments)
 
-        client = AsyncOpenAI(
-            api_key=self.api_key or "dummy",
-            base_url=self.base_url,
+        body = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            "response_format": {"type": "json_object"},
+            "max_tokens": 2000,
+            "temperature": 0.0,
+        }
+
+        data = await asyncio.to_thread(
+            post_json,
+            f"{self.base_url.rstrip('/')}/chat/completions",
+            body,
+            headers={"Authorization": f"Bearer {self.api_key}"} if self.api_key else {},
             timeout=self.timeout,
         )
-        system_prompt = _build_system_prompt(rubrics, bool(answer), attachments)
-        user_prompt = _build_user_prompt(query_text, answer, response, rubrics, tool_trace, attachments)
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ]
-        result = await asyncio.wait_for(
-            client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                response_format={"type": "json_object"},
-                max_tokens=2000,
-            ),
-            timeout=self.timeout,
-        )
-        return _parse_json(result.choices[0].message.content or "")
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        return parse_json(content)
 
     # ------------------------------------------------------------------
     # Mode 2: MCP verification loop
     # ------------------------------------------------------------------
 
-    async def _score_with_mcp(
+    async def score_with_mcp(
         self,
         query_text: str,
         answer: str,
@@ -179,8 +181,8 @@ class Grader:
         """Multi-turn LLM loop — judge calls MCP tools to verify, then scores."""
         from tensoreval.mcp import run_verification_loop
 
-        system_prompt = _build_system_prompt(rubrics, bool(answer), attachments, has_mcp_tools=True)
-        user_prompt = _build_user_prompt(query_text, answer, response, rubrics, tool_trace, attachments)
+        system_prompt = build_system_prompt(rubrics, bool(answer), attachments, has_mcp_tools=True)
+        user_prompt = build_user_prompt(query_text, answer, response, rubrics, tool_trace, attachments)
 
         loop_result = await asyncio.to_thread(
             run_verification_loop,
@@ -199,15 +201,14 @@ class Grader:
             parsed["grader_trace"] = loop_result.get("grader_trace", [])
             return parsed
 
-        # Fallback to direct call if tool loop didn't produce structured output
-        return await self._score_direct(query_text, answer, response, rubrics, tool_trace, attachments)
+        return await self.score_direct(query_text, answer, response, rubrics, tool_trace, attachments)
 
 
 # ---------------------------------------------------------------------------
 # Prompt builders
 # ---------------------------------------------------------------------------
 
-def _build_system_prompt(
+def build_system_prompt(
     rubrics: list[dict[str, Any]],
     has_reference: bool,
     attachments: list[dict[str, Any]] | None = None,
@@ -237,7 +238,7 @@ def _build_system_prompt(
             "Call tools to check. Do NOT just reason about correctness — ACTUALLY VERIFY.\n"
         )
 
-    attachment_section = _build_attachment_section(attachments or [])
+    attachment_section = build_attachment_section(attachments or [])
 
     return f"""You are a rigorous AI agent evaluator. Score an agent's response against rubrics{reference_text}.
 {verify_section}{attachment_section}
@@ -273,7 +274,7 @@ Return exactly one JSON object matching this shape:
 }}"""
 
 
-def _build_attachment_section(attachments: list[dict[str, Any]]) -> str:
+def build_attachment_section(attachments: list[dict[str, Any]]) -> str:
     if not attachments:
         return ""
     lines = []
@@ -294,7 +295,7 @@ def _build_attachment_section(attachments: list[dict[str, Any]]) -> str:
     )
 
 
-def _build_user_prompt(
+def build_user_prompt(
     query_text: str,
     answer: str,
     response: str,
@@ -336,10 +337,10 @@ Evaluate this response. Use the tool trace as evidence of actions the agent actu
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Helpers (public — used by tests and external code)
 # ---------------------------------------------------------------------------
 
-def _extract_query(state: dict[str, Any]) -> str:
+def extract_query(state: dict[str, Any]) -> str:
     query_text = state.get("query", "")
     if query_text:
         return str(query_text)
@@ -350,7 +351,7 @@ def _extract_query(state: dict[str, Any]) -> str:
     return ""
 
 
-def _extract_response(completion: Any) -> str:
+def extract_response(completion: Any) -> str:
     if not completion:
         return ""
     last = completion[-1]
@@ -359,7 +360,7 @@ def _extract_response(completion: Any) -> str:
     return str(getattr(last, "content", ""))
 
 
-def _normalize_rubrics(raw: Any, answer: str = "") -> list[dict[str, Any]]:
+def normalize_rubrics(raw: Any, answer: str = "") -> list[dict[str, Any]]:
     if not raw:
         criteria = "Response should correctly answer the query."
         if answer:
@@ -376,7 +377,7 @@ def _normalize_rubrics(raw: Any, answer: str = "") -> list[dict[str, Any]]:
             rubrics.append({"name": name, "criteria": criteria, "weight": float(item.get("weight", 1.0))})
 
     if not rubrics:
-        return _normalize_rubrics([], answer)
+        return normalize_rubrics([], answer)
 
     total = sum(r["weight"] for r in rubrics)
     if total > 0:
@@ -385,7 +386,7 @@ def _normalize_rubrics(raw: Any, answer: str = "") -> list[dict[str, Any]]:
     return rubrics
 
 
-def _parse_json(text: str) -> dict[str, Any]:
+def parse_json(text: str) -> dict[str, Any]:
     """Parse JSON from LLM output — handles raw, fenced, and embedded JSON."""
     try:
         return json.loads(text.strip())
@@ -405,7 +406,7 @@ def _parse_json(text: str) -> dict[str, Any]:
     raise ValueError("Failed to parse grader JSON output")
 
 
-def _normalize_eval_result(obj: dict[str, Any], rubrics: list[dict[str, Any]]) -> dict[str, Any]:
+def normalize_eval_result(obj: dict[str, Any], rubrics: list[dict[str, Any]]) -> dict[str, Any]:
     rubric_scores: list[dict[str, Any]] = []
     raw_scores = obj.get("rubric_scores", [])
     if isinstance(raw_scores, list):
@@ -417,8 +418,8 @@ def _normalize_eval_result(obj: dict[str, Any], rubrics: list[dict[str, Any]]) -
                 continue
             rubric_scores.append({
                 "rubric_name": name,
-                "score": _to_score(score.get("score")),
-                "weight": _find_weight(rubrics, name),
+                "score": to_score(score.get("score")),
+                "weight": find_weight(rubrics, name),
                 "reasoning": str(score.get("reasoning") or score.get("reason") or ""),
             })
 
@@ -444,21 +445,21 @@ def _normalize_eval_result(obj: dict[str, Any], rubrics: list[dict[str, Any]]) -
     return result
 
 
-def _find_weight(rubrics: list[dict[str, Any]], rubric_name: str) -> float:
+def find_weight(rubrics: list[dict[str, Any]], rubric_name: str) -> float:
     for rubric in rubrics:
         if rubric["name"] == rubric_name:
             return float(rubric["weight"])
     return 1.0 / len(rubrics) if rubrics else 1.0
 
 
-def _to_score(value: Any) -> float:
+def to_score(value: Any) -> float:
     try:
         return max(0.0, min(1.0, float(value)))
     except (TypeError, ValueError):
         return 0.0
 
 
-def _simple_score(answer: str, response: str) -> float:
+def simple_score(answer: str, response: str) -> float:
     """Fallback: simple reference-answer matching."""
     if not answer or not response:
         return 0.0
@@ -469,7 +470,7 @@ def _simple_score(answer: str, response: str) -> float:
     return 1.0 if answer.lower().strip() in response.lower().strip() else 0.0
 
 
-def _fallback_result(rubrics: list[dict[str, Any]], score: float, reason: str) -> dict[str, Any]:
+def fallback_result(rubrics: list[dict[str, Any]], score: float, reason: str) -> dict[str, Any]:
     return {
         "rubric_scores": [
             {
@@ -484,3 +485,27 @@ def _fallback_result(rubrics: list[dict[str, Any]], score: float, reason: str) -
         "passed": score >= PASS_THRESHOLD,
         "grader_reasoning": "Fallback scoring used because LLM grading failed.",
     }
+
+
+def post_json(
+    url: str,
+    body: dict[str, Any],
+    headers: dict[str, str] | None = None,
+    timeout: float = 30.0,
+) -> dict[str, Any]:
+    """POST JSON and return parsed JSON response (stdlib urllib only)."""
+    data = json.dumps(body).encode("utf-8")
+    hdrs = {"Content-Type": "application/json"}
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        err_body = ""
+        try:
+            err_body = exc.read().decode()
+        except Exception:
+            pass
+        raise RuntimeError(f"HTTP {exc.code} from {url}: {err_body}") from exc
