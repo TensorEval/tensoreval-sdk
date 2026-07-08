@@ -4,22 +4,18 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tensoreval"
-version = "0.6.0"
+version = "1.0.0"
 description = "TensorEval — Evaluation SDK for AI Agents"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
     "openai>=2.36.0",
-    "httpx>=0.27",
     "nest_asyncio>=1.6",
 ]
 
 [project.optional-dependencies]
-anthropic = ["anthropic>=0.30"]
 datasets = ["datasets>=2.0"]
-all = ["tensoreval[anthropic,datasets]"]
-langchain = ["langchain-core>=1.4", "langchain-openai>=1.3"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["tensoreval"]

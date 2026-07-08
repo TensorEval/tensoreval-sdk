@@ -1,11 +1,10 @@
 """Environment configuration and lifecycle manager.
 
 Handles:
-- System prompt
+- System prompt for the agent
 - Docker container management (start/stop)
-- API key injection
-- MCP server connection
-- Agent endpoint connection
+- MCP server connection (direct URL or Docker)
+- Agent endpoint connection (direct URL or Docker)
 
 Usage:
     # Simple (no Docker)
@@ -14,7 +13,7 @@ Usage:
     # With Docker
     env = te.Environment(
         system_prompt="...",
-        agent={"image": "python:3.12-slim", "port": 8000, "env": {"KEY": "val"}},
+        agent={"image": "python:3.12-slim", "port": 8000, "command": "python /app/agent.py"},
         mcp={"image": "node:18-slim", "port": 9000},
         env_file=".env",
     )
@@ -27,63 +26,64 @@ Usage:
     )
 """
 
+from __future__ import annotations
+
 from typing import Any, Callable
 
 
 class Environment:
-    """Environment configuration and lifecycle manager."""
+    """Environment configuration and lifecycle manager.
+
+    Args:
+        system_prompt: System prompt for the agent.
+        tools: Local Python callables to expose as tools.
+        agent_url: Direct URL to an agent endpoint (no Docker).
+        mcp_url: Direct URL to an MCP server (no Docker).
+        mcp_servers: List of MCP server configs (dicts or MCPServer objects).
+        agent: Docker config dict for the agent service.
+        mcp: Docker config dict for the MCP server service.
+        env_file: Path to a .env file for Docker containers.
+        compose_yaml: Path to an existing compose.yaml file.
+    """
 
     def __init__(
         self,
         system_prompt: str | None = None,
         tools: list[Callable] | None = None,
-        docker_image: str | None = None,
-        compose_yaml: str | None = None,
+        agent_url: str | None = None,
         mcp_url: str | None = None,
         mcp_servers: list[Any] | None = None,
-        agent_url: str | None = None,
         agent: dict[str, Any] | None = None,
         mcp: dict[str, Any] | None = None,
         env_file: str | None = None,
-        config: dict[str, Any] | None = None,
-        agent_port: int | None = None,
-        mcp_port: int | None = None,
+        compose_yaml: str | None = None,
     ):
         self.system_prompt = system_prompt
         self.tools = tools or []
-        self.docker_image = docker_image
-        self.compose_yaml = compose_yaml
+        self.agent_url = agent_url
         self.mcp_url = mcp_url
         self.mcp_servers = mcp_servers or []
-        self.agent_url = agent_url
         self.agent = agent
         self.mcp = mcp
         self.env_file = env_file
-        self.config = config or {}
-        self.agent_port = agent_port
-        self.mcp_port = mcp_port
+        self.compose_yaml = compose_yaml
         self._started = False
         self._compose = None
-
-    # ------------------------------------------------------------------
-    # Docker lifecycle
-    # ------------------------------------------------------------------
 
     async def start(self) -> dict[str, str]:
         """Start Docker containers if configured.
 
         Returns:
-            Dict of service_name -> URL
+            Dict of service_name → URL.
         """
         if self._started:
             return self._get_urls()
 
-        # If direct agent_url set AND no Docker services needed, skip startup
+        # If direct URLs set and no Docker services needed, skip startup
         if self.agent_url and not self.agent and not self.mcp:
             self._started = True
             return self._get_urls()
 
-        # Build Docker compose from config
         if self.agent or self.mcp:
             self._compose = self._build_compose()
             urls = await self._compose.up()
@@ -119,9 +119,9 @@ class Environment:
         return None
 
     def _build_compose(self):
-        from tensoreval.tools.docker import DockerCompose
+        from tensoreval.docker import DockerCompose
 
-        services = {}
+        services: dict[str, dict[str, Any]] = {}
         if self.agent:
             services["agent"] = self.agent
         if self.mcp:
@@ -133,18 +133,18 @@ class Environment:
         )
 
     def _get_urls(self) -> dict[str, str]:
-        urls = {}
+        urls: dict[str, str] = {}
         if self.agent_url:
             urls["agent"] = self.agent_url
         if self.mcp_url:
             urls["mcp"] = self.mcp_url
         return urls
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> "Environment":
         await self.start()
         return self
 
-    async def __aexit__(self, *args):
+    async def __aexit__(self, *args: Any) -> None:
         await self.stop()
 
     def __repr__(self) -> str:

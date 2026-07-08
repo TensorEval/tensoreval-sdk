@@ -1,6 +1,16 @@
 """Docker Compose manager for TensorEval.
 
 Handles container lifecycle: start, stop, exec, file I/O.
+
+Usage:
+    from tensoreval.docker import DockerCompose
+
+    compose = DockerCompose(services={
+        "agent": {"image": "python:3.12-slim", "port": 8000, "command": "python /app/agent.py"},
+    })
+    ports = await compose.up()
+    # ... run evaluation ...
+    await compose.down()
 """
 
 from __future__ import annotations
@@ -15,13 +25,12 @@ from typing import Any
 class DockerCompose:
     """Manages Docker Compose projects for evaluation.
 
-    Usage:
-        compose = DockerCompose(services={
-            "agent": {"image": "python:3.12-slim", "port": 8000, "command": "python /app/agent.py"},
-        })
-        ports = await compose.up()
-        # ... run evaluation ...
-        await compose.down()
+    Args:
+        services: Dict of service name → config (image, port, command, env, volumes).
+        compose_yaml: Path to an existing compose.yaml file. If provided,
+            overrides auto-generation from ``services``.
+        env_file: Path to a .env file to load environment variables from.
+        project_name: Docker Compose project name (auto-generated if empty).
     """
 
     def __init__(
@@ -40,15 +49,11 @@ class DockerCompose:
         self._is_up = False
 
     def _generate_compose_yaml(self) -> str:
-        """Generate compose.yaml from services config."""
         lines = ["services:"]
-
         for name, config in self.services.items():
             lines.append(f"  {name}:")
             lines.append(f"    image: {config.get('image', 'ubuntu:24.04')}")
-
-            cmd = config.get("command", "tail -f /dev/null")
-            lines.append(f"    command: {cmd}")
+            lines.append(f"    command: {config.get('command', 'tail -f /dev/null')}")
             lines.append("    init: true")
             lines.append("    stop_grace_period: 1s")
 
@@ -89,7 +94,6 @@ class DockerCompose:
 
         self._tmpdir = tempfile.mkdtemp(prefix="tensoreval-compose-")
         self._compose_path = os.path.join(self._tmpdir, "compose.yaml")
-
         compose_content = self._generate_compose_yaml()
 
         if self.env_file:
@@ -102,11 +106,10 @@ class DockerCompose:
 
         with open(self._compose_path, "w") as f:
             f.write(compose_content)
-
         return self._compose_path
 
     async def up(self) -> dict[str, str]:
-        """Start all services. Returns dict of service_name -> URL."""
+        """Start all services. Returns dict of service_name → URL."""
         compose_path = self._ensure_compose_file()
 
         env = {**os.environ}
@@ -124,7 +127,6 @@ class DockerCompose:
             "-f", compose_path,
             "up", "-d", "--wait",
         ]
-
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -137,26 +139,22 @@ class DockerCompose:
             raise RuntimeError(f"docker compose up failed: {stderr.decode()}")
 
         self._is_up = True
-
-        urls = {}
+        urls: dict[str, str] = {}
         for name, config in self.services.items():
             if "port" in config:
                 urls[name] = f"http://localhost:{config['port']}"
-
         return urls
 
     async def down(self) -> None:
         """Stop and remove all services."""
         if not self._is_up or not self._compose_path:
             return
-
         cmd = [
             "docker", "compose",
             "--project-name", self.project_name,
             "-f", self._compose_path,
             "down", "--volumes", "--remove-orphans",
         ]
-
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -169,14 +167,12 @@ class DockerCompose:
         """Execute a command inside a running service container."""
         if not self._compose_path:
             raise RuntimeError("Compose not started. Call up() first.")
-
         exec_cmd = [
             "docker", "compose",
             "--project-name", self.project_name,
             "-f", self._compose_path,
             "exec", "-T", service,
         ] + cmd
-
         proc = await asyncio.create_subprocess_exec(
             *exec_cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -187,9 +183,9 @@ class DockerCompose:
 
     async def write_file(self, service: str, path: str, contents: str | bytes) -> None:
         """Write a file into a container."""
+        import base64
         if isinstance(contents, str):
             contents = contents.encode()
-        import base64
         b64 = base64.b64encode(contents).decode()
         await self.exec(service, ["sh", "-c", f'echo "{b64}" | base64 -d > {path}'])
 
@@ -199,17 +195,3 @@ class DockerCompose:
         if rc != 0:
             raise FileNotFoundError(f"File not found: {path}")
         return stdout
-
-    def get_agent_url(self) -> str | None:
-        """Get the agent service URL."""
-        for name, config in self.services.items():
-            if "agent" in name.lower() and "port" in config:
-                return f"http://localhost:{config['port']}"
-        return None
-
-    def get_mcp_url(self) -> str | None:
-        """Get the MCP server URL."""
-        for name, config in self.services.items():
-            if "mcp" in name.lower() and "port" in config:
-                return f"http://localhost:{config['port']}/mcp"
-        return None

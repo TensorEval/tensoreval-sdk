@@ -1,19 +1,20 @@
-"""Core data structures for TensorEval SDK.
-
-All shared data structures live here. Enums are in enums.py.
-"""
+"""Core data structures for TensorEval SDK."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
 
-from tensoreval.enums import GraderType
-
 
 @dataclass(frozen=True)
 class Rubric:
-    """A single evaluation criterion."""
+    """A single evaluation criterion.
+
+    Attributes:
+        name: Short identifier for the rubric.
+        criteria: Description of what a correct response looks like.
+        weight: Relative importance (normalized across all rubrics).
+    """
 
     name: str
     criteria: str
@@ -29,21 +30,16 @@ class Rubric:
 
 
 @dataclass
-class Score:
-    """Result of grading a single rubric."""
-
-    value: float
-    """Score between 0.0 and 1.0."""
-
-    explanation: str = ""
-    """Why this score was given."""
-
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass
 class Sample:
-    """A single evaluation task."""
+    """A single evaluation task.
+
+    Attributes:
+        input: The user query or task description.
+        target: Reference answer (optional — graders can work without it).
+        id: Unique identifier (auto-generated if empty).
+        rubrics: Evaluation criteria. Defaults to a single "correctness" rubric.
+        metadata: Arbitrary metadata (attachments, category, etc.).
+    """
 
     input: str
     target: str = ""
@@ -51,41 +47,39 @@ class Sample:
     rubrics: list[Rubric] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if not self.id:
             self.id = f"q_{hash(self.input) % 10000:04d}"
 
 
 @dataclass
-class TEvalResult:
+class AgentResult:
     """Structured return value from an agent callable.
 
-    The agent receives a query string and returns a ``TEvalResult``
+    The agent receives a query string and returns an ``AgentResult``
     containing the final response and an optional tool trace — the
     list of tool calls the agent made while processing the query.
 
-    If the agent returns a plain ``str``, it is treated as a
-    ``TEvalResult(response=str, tool_trace=[])``.
+    If the agent returns a plain ``str``, it is treated as
+    ``AgentResult(response=str)``.
 
     Attributes:
         response: The agent's final text response.
         tool_trace: Optional list of tool call records. Each entry is a
-            dict with keys ``tool``, ``args``, and ``result``. The
-            customer is responsible for capturing this — the SDK does
-            not intercept tool calls inside the agent.
+            dict with keys ``tool``, ``args``, and ``result``.
     """
 
     response: str = ""
     tool_trace: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
-    def coerce(cls, value: Any) -> "TEvalResult":
-        """Normalize a return value into a TEvalResult.
+    def coerce(cls, value: Any) -> "AgentResult":
+        """Normalize a return value into an AgentResult.
 
         Accepts:
-        - TEvalResult → returned as-is
-        - str → TEvalResult(response=str)
-        - dict with 'response' key → TEvalResult(**dict)
+            - AgentResult → returned as-is
+            - str → AgentResult(response=str)
+            - dict with 'response' key → AgentResult(**dict)
         """
         if isinstance(value, cls):
             return value
@@ -96,20 +90,29 @@ class TEvalResult:
                 response=str(value.get("response", "")),
                 tool_trace=list(value.get("tool_trace", [])),
             )
-        # Fallback: stringify
         return cls(response=str(value) if value is not None else "")
 
 
 @dataclass
 class Run:
-    """Result of evaluating a single sample."""
+    """Result of evaluating a single sample.
+
+    Attributes:
+        sample_id: ID of the evaluated sample.
+        query: The original query.
+        answer: Reference answer (if any).
+        response: Agent's response.
+        reward: Score from the grader (0.0–1.0).
+        latency_ms: Time taken in milliseconds.
+        error: Error message if the run failed.
+        metadata: Additional data (grader_result, tool_trace, etc.).
+    """
 
     sample_id: str
     query: str
     answer: str
     response: str
     reward: float
-    scores: dict[str, Score] = field(default_factory=dict)
     latency_ms: float = 0.0
     error: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -117,16 +120,24 @@ class Run:
 
 @dataclass
 class EvalConfig:
-    """Configuration for an evaluation run."""
+    """Configuration for an evaluation run.
 
-    model: str = "openai/gpt-5.5"
+    Attributes:
+        model: Model ID for the grader.
+        api_key: API key for the model.
+        base_url: OpenAI-compatible base URL.
+        workers: Number of concurrent evaluation workers.
+        mcp_servers: MCP server configs for grader verification.
+        system_prompt: System prompt for the agent.
+        timeout: Request timeout in seconds.
+        pass_threshold: Score threshold for pass/fail.
+    """
+
+    model: str = "gpt-4o"
     api_key: str | None = None
     base_url: str | None = None
     workers: int = 4
-    agent_port: int | None = None
-    mcp_port: int | None = None
     mcp_servers: list[Any] = field(default_factory=list)
-    tools: list[Any] = field(default_factory=list)
     system_prompt: str | None = None
     timeout: float = 60.0
     pass_threshold: float = 0.8
@@ -134,7 +145,17 @@ class EvalConfig:
 
 @dataclass
 class Summary:
-    """Aggregate results from an evaluation run."""
+    """Aggregate results from an evaluation run.
+
+    Attributes:
+        model: Model used for grading.
+        num_runs: Number of samples evaluated.
+        avg_reward: Average score across all runs.
+        pass_rate: Fraction of runs that passed.
+        pass_count: Number of passing runs.
+        fail_count: Number of failing runs.
+        total_latency_ms: Total latency in milliseconds.
+    """
 
     model: str
     num_runs: int

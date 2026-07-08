@@ -1,17 +1,20 @@
-"""Data utilities for dataset loading and answer extraction.
+"""Utility functions for TensorEval.
 
-Ported from PrimeIntellect Verifiers (MIT License).
+Answer extraction helpers (ported from PrimeIntellect Verifiers, MIT License)
+and HuggingFace dataset loading.
 """
+
+from __future__ import annotations
 
 from typing import Any, Callable
 
 
 def extract_boxed_answer(text: str, strict: bool = False) -> str:
-    """Extract the last \\boxed{...} answer from text.
+    """Extract the last ``\\boxed{...}`` answer from text.
 
     Args:
         text: The text to extract from.
-        strict: If True, return "" when no \\boxed{} is found.
+        strict: If True, return ``""`` when no ``\\boxed{}`` is found.
     """
     boxed_start = text.rfind("\\boxed{")
     if boxed_start == -1:
@@ -32,43 +35,38 @@ def extract_boxed_answer(text: str, strict: bool = False) -> str:
 
 
 def extract_hash_answer(text: str) -> str:
-    """Extract answer after #### separator (GSM8K format)."""
+    """Extract answer after ``####`` separator (GSM8K format)."""
     if "####" not in text:
         return text
     return text.split("####")[1].strip()
 
 
-def get_preprocess_fn(name: str) -> Callable[[dict], dict]:
-    """Return a preprocessing function for a named dataset."""
-    if name == "gsm8k":
-        def preprocess_gsm8k(x: dict[str, Any]) -> dict[str, Any]:
-            return {"question": x["question"], "answer": extract_hash_answer(x["answer"])}
-        return preprocess_gsm8k
-    elif name == "math":
-        def preprocess_math(x: dict[str, Any]) -> dict[str, Any]:
-            return {"question": x["problem"], "answer": extract_boxed_answer(x["solution"])}
-        return preprocess_math
-    else:
-        raise ValueError(f"Dataset {name} not supported. Supported: gsm8k, math")
+def load_example_dataset(
+    name: str = "gsm8k",
+    split: str | None = None,
+    n: int | None = None,
+    seed: int = 0,
+) -> Any:
+    """Load a standard benchmark dataset from HuggingFace.
 
-
-def load_example_dataset(name: str = "gsm8k", split: str | None = None, n: int | None = None, seed: int = 0) -> Any:
-    """Load a standard benchmark dataset from HuggingFace."""
+    Requires: ``pip install tensoreval[datasets]``
+    """
     from datasets import load_dataset
 
     if name == "gsm8k":
         if split is None:
             split = "test"
         dataset = load_dataset("openai/gsm8k", "main")[split]
+        preprocess = lambda x: {"question": x["question"], "answer": extract_hash_answer(x["answer"])}
     elif name == "math":
         if split is None:
             split = "train"
         dataset = load_dataset("chiayewken/competition_math")[split]
+        preprocess = lambda x: {"question": x["problem"], "answer": extract_boxed_answer(x["solution"])}
     else:
-        raise ValueError(f"Dataset {name} not supported.")
+        raise ValueError(f"Dataset {name} not supported. Supported: gsm8k, math")
 
-    preprocess_fn = get_preprocess_fn(name)
     if n is not None and n > 0:
         dataset = dataset.shuffle(seed=seed).select(range(n))
-    dataset = dataset.map(preprocess_fn, num_proc=4, remove_columns=dataset.column_names)
+    dataset = dataset.map(preprocess, num_proc=4, remove_columns=dataset.column_names)
     return dataset
