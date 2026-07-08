@@ -9,14 +9,25 @@ Two modes:
    When ``mcp_urls`` are passed to ``score()``, the judge can call the
    agent's own MCP tools to independently verify claims before scoring.
 
-Both modes use the OpenAI Chat Completions API via raw ``urllib`` —
-no external SDK dependencies. Any OpenAI-compatible endpoint works
-(OpenAI, Azure, local vLLM, etc.).
+Supports two provider families via raw ``urllib`` (no SDK dependencies):
+
+- **OpenAI-compatible** (default): OpenAI, Azure, OpenRouter, Ollama, vLLM.
+  Uses ``/chat/completions`` with ``Authorization: Bearer`` header.
+- **Anthropic**: Claude models via ``/v1/messages`` with ``x-api-key``
+  header and ``anthropic-version: 2023-06-01``.
 
 Usage:
     from tensoreval import Grader
 
+    # OpenAI-compatible (default)
     grader = Grader(model="gpt-4o", api_key="sk-...")
+
+    # Anthropic native
+    grader = Grader(
+        provider="anthropic",
+        model="claude-sonnet-4-5",
+        api_key="sk-ant-...",
+    )
 
     # Direct scoring
     score = await grader.score(state)
@@ -44,33 +55,71 @@ class Grader:
     """LLM-as-judge rubric grader.
 
     Args:
-        model: Model ID (e.g. ``"gpt-4o"``).
-        api_key: API key. Falls back to ``OPENAI_API_KEY`` env var.
-        base_url: OpenAI-compatible base URL. Defaults to OpenAI's API.
+        provider: LLM provider — ``"openai"`` (default, also works for
+            Azure, OpenRouter, Ollama, vLLM) or ``"anthropic"`` (Claude
+            native API).
+        model: Model ID (e.g. ``"gpt-4o"``, ``"claude-sonnet-4-5"``).
+        api_key: API key. Falls back to provider-specific env var.
+        base_url: API base URL. Defaults to the provider's official API.
         fallback_on_error: If true, use simple reference-answer matching
             when the LLM call fails.
         timeout: Request timeout in seconds.
     """
 
+    # Provider → (default_model, default_base_url, env_key)
+    PROVIDER_DEFAULTS: dict[str, tuple[str, str, str]] = {
+        "openai": ("gpt-4o", "https://api.openai.com/v1", "OPENAI_API_KEY"),
+        "anthropic": ("claude-sonnet-4-5", "https://api.anthropic.com", "ANTHROPIC_API_KEY"),
+        "openrouter": ("openai/gpt-4o", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY"),
+        "ollama": ("llama3.1", "http://localhost:11434/v1", ""),
+    }
+
     def __init__(
         self,
+        provider: str | None = None,
         model: str | None = None,
         api_key: str | None = None,
         base_url: str | None = None,
         fallback_on_error: bool = False,
         timeout: float = 60.0,
     ):
-        self.model = model or os.environ.get("TENSOREVAL_MODEL_NAME") or "gpt-4o"
+        # Auto-detect provider from model name if not specified
+        if provider is None:
+            if model and model.startswith("claude"):
+                provider = "anthropic"
+            elif os.environ.get("ANTHROPIC_API_KEY") and not os.environ.get("OPENAI_API_KEY"):
+                provider = "anthropic"
+            else:
+                provider = "openai"
+        provider = provider.lower()
+
+        defaults = self.PROVIDER_DEFAULTS.get(provider, self.PROVIDER_DEFAULTS["openai"])
+        default_model, default_base_url, env_key = defaults
+
+        self.provider = provider
+        self.model = (
+            model
+            or os.environ.get("TENSOREVAL_MODEL_NAME")
+            or default_model
+        )
         self.api_key = (
             api_key
             or os.environ.get("AI_GATEWAY_API_KEY")
-            or os.environ.get("OPENAI_API_KEY")
             or os.environ.get("TENSOREVAL_MODEL_API_KEY")
+            or (os.environ.get(env_key) if env_key else None)
         )
-        self.base_url = base_url or os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1"
+        self.base_url = (
+            base_url
+            or os.environ.get("OPENAI_BASE_URL")
+            or default_base_url
+        )
         self.fallback_on_error = fallback_on_error
         self.timeout = timeout
         self.last_result: dict[str, Any] | None = None
+
+    @property
+    def is_anthropic(self) -> bool:
+        return self.provider == "anthropic"
 
     async def score(self, state: dict[str, Any], **kwargs: Any) -> float:
         """Score one response and return its weighted score (0.0–1.0).
@@ -144,25 +193,26 @@ class Grader:
         system_prompt = build_system_prompt(rubrics, bool(answer), attachments)
         user_prompt = build_user_prompt(query_text, answer, response, rubrics, tool_trace, attachments)
 
-        body = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            "response_format": {"type": "json_object"},
-            "max_tokens": 2000,
-            "temperature": 0.0,
-        }
-
-        data = await asyncio.to_thread(
-            post_json,
-            f"{self.base_url.rstrip('/')}/chat/completions",
-            body,
-            headers={"Authorization": f"Bearer {self.api_key}"} if self.api_key else {},
-            timeout=self.timeout,
-        )
-        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if self.is_anthropic:
+            content = await asyncio.to_thread(
+                complete_anthropic,
+                model=self.model,
+                api_key=self.api_key or "",
+                base_url=self.base_url,
+                system_prompt=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+                timeout=self.timeout,
+            )
+        else:
+            content = await asyncio.to_thread(
+                complete_openai,
+                model=self.model,
+                api_key=self.api_key or "",
+                base_url=self.base_url,
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                timeout=self.timeout,
+            )
         return parse_json(content)
 
     # ------------------------------------------------------------------
@@ -188,6 +238,7 @@ class Grader:
             model=self.model,
             api_key=self.api_key or "",
             base_url=self.base_url,
+            provider=self.provider,
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             mcp_urls=mcp_urls,
@@ -256,6 +307,7 @@ def run_verification_loop(
     max_turns: int = 10,
     timeout: float = 120.0,
     temperature: float = 0.0,
+    provider: str = "openai",
 ) -> dict[str, Any]:
     """Multi-turn LLM loop with MCP tool access for verification.
 
@@ -270,73 +322,51 @@ def run_verification_loop(
     """
     # Discover tools from all MCP servers
     discovered = discover_mcp_tools(mcp_urls, timeout=timeout)
-    openai_tools = [
-        {
-            "type": "function",
-            "function": {
-                "name": t["name"],
-                "description": t["description"],
-                "parameters": t["parameters"],
-            },
-        }
-        for t in discovered
-    ]
-    # Map tool name → server URL for routing calls
     tool_server_map = {t["name"]: t["server_url"] for t in discovered}
 
+    # Build tool specs for the provider
+    if provider == "anthropic":
+        tools_spec = [
+            {"name": t["name"], "description": t["description"], "input_schema": t["parameters"]}
+            for t in discovered
+        ]
+    else:
+        tools_spec = [
+            {"type": "function", "function": {
+                "name": t["name"], "description": t["description"], "parameters": t["parameters"],
+            }}
+            for t in discovered
+        ]
+
     messages: list[dict[str, Any]] = [
-        {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
     trace: list[dict[str, Any]] = []
 
     for turn in range(max_turns):
-        body: dict[str, Any] = {
-            "model": model,
-            "messages": messages,
-            "temperature": temperature,
-        }
-        if openai_tools:
-            body["tools"] = openai_tools
-            body["tool_choice"] = "auto"
-
-        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        data = post_json(
-            f"{base_url.rstrip('/')}/chat/completions",
-            body, headers=headers, timeout=timeout,
-        )
-
-        message = data.get("choices", [{}])[0].get("message", {})
-        content = message.get("content") or ""
-        tool_calls = message.get("tool_calls") or []
+        if provider == "anthropic":
+            content, tool_calls = complete_anthropic_with_tools(
+                model=model, api_key=api_key, base_url=base_url,
+                system_prompt=system_prompt, messages=messages,
+                tools=tools_spec, temperature=temperature, timeout=timeout,
+            )
+        else:
+            content, tool_calls = complete_openai_with_tools(
+                model=model, api_key=api_key, base_url=base_url,
+                system_prompt=system_prompt, messages=messages,
+                tools=tools_spec, temperature=temperature, timeout=timeout,
+            )
 
         if not tool_calls:
             trace.append({"type": "final", "turn": turn, "content": content[:500]})
             return {"content": content, "grader_trace": trace, "parsed": try_parse_json(content)}
 
-        messages.append({
-            "role": "assistant",
-            "content": content,
-            "tool_calls": [
-                {
-                    "id": tc.get("id", ""),
-                    "type": "function",
-                    "function": {
-                        "name": tc.get("function", {}).get("name", ""),
-                        "arguments": tc.get("function", {}).get("arguments", "{}"),
-                    },
-                }
-                for tc in tool_calls
-            ],
-        })
+        # Append assistant message with tool calls
+        messages.append({"role": "assistant", "content": content, "tool_calls": tool_calls})
 
-        for tc in tool_calls:
-            fn = tc.get("function", {})
-            name = fn.get("name", "")
-            try:
-                args = json.loads(fn.get("arguments") or "{}")
-            except json.JSONDecodeError:
-                args = {}
+        for call in tool_calls:
+            name = call.get("name", "")
+            args = call.get("arguments", {})
 
             server_url = tool_server_map.get(name, "")
             started = time.monotonic()
@@ -354,7 +384,7 @@ def run_verification_loop(
 
             messages.append({
                 "role": "tool",
-                "tool_call_id": tc.get("id", ""),
+                "tool_call_id": call.get("id", ""),
                 "content": json.dumps(result, default=str),
             })
 
@@ -364,6 +394,169 @@ def run_verification_loop(
         "parsed": None,
         "error": "Verification loop exceeded max_turns",
     }
+
+
+# ---------------------------------------------------------------------------
+# LLM completion helpers (urllib only, no SDK)
+# ---------------------------------------------------------------------------
+
+def complete_openai(
+    *,
+    model: str,
+    api_key: str,
+    base_url: str,
+    system_prompt: str,
+    user_prompt: str,
+    timeout: float = 60.0,
+) -> str:
+    """Single OpenAI-compatible chat completion. Returns content string."""
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "response_format": {"type": "json_object"},
+        "max_tokens": 2000,
+        "temperature": 0.0,
+    }
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    data = post_json(f"{base_url.rstrip('/')}/chat/completions", body, headers=headers, timeout=timeout)
+    return data.get("choices", [{}])[0].get("message", {}).get("content", "")
+
+
+def complete_anthropic(
+    *,
+    model: str,
+    api_key: str,
+    base_url: str,
+    system_prompt: str,
+    messages: list[dict[str, Any]],
+    timeout: float = 60.0,
+) -> str:
+    """Single Anthropic /v1/messages call. Returns content string."""
+    body = {
+        "model": model,
+        "max_tokens": 2000,
+        "temperature": 0.0,
+        "system": system_prompt,
+        "messages": messages,
+    }
+    headers = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
+    if api_key:
+        headers["x-api-key"] = api_key
+    data = post_json(f"{base_url.rstrip('/')}/v1/messages", body, headers=headers, timeout=timeout)
+    content = ""
+    for block in data.get("content", []):
+        if block.get("type") == "text":
+            content += block.get("text", "")
+    return content
+
+
+def complete_openai_with_tools(
+    *,
+    model: str,
+    api_key: str,
+    base_url: str,
+    system_prompt: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    temperature: float = 0.0,
+    timeout: float = 120.0,
+) -> tuple[str, list[dict[str, Any]]]:
+    """OpenAI chat completion with tool support. Returns (content, tool_calls)."""
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": [{"role": "system", "content": system_prompt}] + messages,
+        "temperature": temperature,
+    }
+    if tools:
+        body["tools"] = tools
+        body["tool_choice"] = "auto"
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    data = post_json(f"{base_url.rstrip('/')}/chat/completions", body, headers=headers, timeout=timeout)
+    message = data.get("choices", [{}])[0].get("message", {})
+    content = message.get("content") or ""
+    raw_calls = message.get("tool_calls") or []
+    tool_calls = []
+    for call in raw_calls:
+        fn = call.get("function", {})
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except json.JSONDecodeError:
+            args = {}
+        tool_calls.append({"id": call.get("id", ""), "name": fn.get("name", ""), "arguments": args})
+    return content, tool_calls
+
+
+def complete_anthropic_with_tools(
+    *,
+    model: str,
+    api_key: str,
+    base_url: str,
+    system_prompt: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    temperature: float = 0.0,
+    timeout: float = 120.0,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Anthropic /v1/messages with tool support. Returns (content, tool_calls)."""
+    body: dict[str, Any] = {
+        "model": model,
+        "max_tokens": 2000,
+        "temperature": temperature,
+        "system": system_prompt,
+        "messages": to_anthropic_messages(messages),
+    }
+    if tools:
+        body["tools"] = tools
+    headers = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
+    if api_key:
+        headers["x-api-key"] = api_key
+    data = post_json(f"{base_url.rstrip('/')}/v1/messages", body, headers=headers, timeout=timeout)
+    content = ""
+    tool_calls: list[dict[str, Any]] = []
+    for block in data.get("content", []):
+        if block.get("type") == "text":
+            content += block.get("text", "")
+        elif block.get("type") == "tool_use":
+            tool_calls.append({
+                "id": block.get("id", ""),
+                "name": block.get("name", ""),
+                "arguments": block.get("input", {}),
+            })
+    return content, tool_calls
+
+
+def to_anthropic_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Convert OpenAI-format messages to Anthropic format."""
+    converted: list[dict[str, Any]] = []
+    for msg in messages:
+        role = msg.get("role")
+        if role == "tool":
+            converted.append({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": msg.get("tool_call_id", ""),
+                    "content": msg.get("content", ""),
+                }],
+            })
+        elif role == "assistant" and msg.get("tool_calls"):
+            content: list[dict[str, Any]] = []
+            if msg.get("content"):
+                content.append({"type": "text", "text": msg["content"]})
+            for call in msg.get("tool_calls", []):
+                content.append({
+                    "type": "tool_use",
+                    "id": call.get("id", ""),
+                    "name": call.get("name", ""),
+                    "input": call.get("arguments", {}),
+                })
+            converted.append({"role": "assistant", "content": content})
+        else:
+            converted.append({"role": role, "content": msg.get("content", "")})
+    return converted
 
 
 # ---------------------------------------------------------------------------

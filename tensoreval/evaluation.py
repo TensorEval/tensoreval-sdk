@@ -16,6 +16,7 @@ dashboard in real time (start → per-query updates → complete).
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import os
 import sys
@@ -86,6 +87,63 @@ class EvaluationResult:
             }
             for r in self.runs
         ]
+
+    def recommendations(self) -> list[str]:
+        """Generate actionable recommendations based on results."""
+        if not self.runs:
+            return ["No runs to analyze."]
+        errors = [r for r in self.runs if r.error]
+        failed = [r for r in self.runs if r.reward < self.config.pass_threshold and not r.error]
+        recs: list[str] = []
+        if errors:
+            recs.append(f"Fix agent errors first: {len(errors)}/{len(self.runs)} runs errored.")
+        if failed:
+            recs.append(f"Review failed cases: {len(failed)}/{len(self.runs)} runs scored below {self.config.pass_threshold}.")
+        if not recs:
+            recs.append("Agent passed all evaluated cases.")
+        return recs
+
+    def report(self, path: str | Path = "report.html") -> str:
+        """Generate a self-contained HTML report and write it to ``path``.
+
+        Returns the path to the written file.
+        """
+        path = Path(path)
+        summary = self.summary()
+        cards = "\n".join(_run_card(run, self.config.pass_threshold) for run in self.runs)
+        recs = "".join(f"<li>{html.escape(rec)}</li>" for rec in self.recommendations())
+        body = f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>TensorEval Report</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 32px; color: #111827; background: #f9fafb; }}
+    .summary {{ display: flex; gap: 12px; margin: 16px 0 24px; }}
+    .metric, .run {{ background: white; border: 1px solid #e5e7eb; border-radius: 8px; padding: 14px; }}
+    .metric b {{ display: block; font-size: 24px; }}
+    .run {{ margin: 14px 0; }}
+    .ok {{ color: #15803d; }} .fail {{ color: #b91c1c; }}
+    pre {{ overflow: auto; background: #111827; color: #f9fafb; padding: 12px; border-radius: 6px; font-size: 13px; }}
+    .rubric {{ margin: 4px 0; font-size: 13px; }}
+  </style>
+</head>
+<body>
+  <h1>TensorEval Report</h1>
+  <div class="summary">
+    <div class="metric"><b>{summary.avg_reward:.2f}</b>Avg Reward</div>
+    <div class="metric"><b>{summary.pass_rate:.0%}</b>Pass Rate</div>
+    <div class="metric"><b>{summary.pass_count}/{summary.num_runs}</b>Passed</div>
+  </div>
+  <h2>Recommendations</h2>
+  <ul>{recs}</ul>
+  <h2>Runs</h2>
+  {cards}
+</body>
+</html>"""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(body, encoding="utf-8")
+        return str(path)
 
     def save(self, path: str | Path) -> None:
         path = Path(path)
@@ -294,87 +352,107 @@ async def run_eval(
     platform_client: Any = None,
     live_run_id: str | None = None,
 ) -> EvaluationResult:
+    """Two-stage evaluation pipeline (matches backend flow).
+
+    Stage 1: Call the agent for all samples concurrently.
+    Stage 2: Grade all responses concurrently.
+    """
     sem = asyncio.Semaphore(config.workers)
     mcp_urls = mcp_urls or []
+    n = len(dataset)
 
-    async def eval_one(idx: int) -> Run:
+    # --- Stage 1: Call agent for all samples ---
+    async def call_agent_one(idx: int) -> tuple[int, AgentResult, float, str | None]:
+        sample = dataset[idx]
         async with sem:
-            run = await evaluate_single(idx, dataset, grader, agent, config, mcp_urls)
+            start = time.monotonic()
+            try:
+                raw = agent(sample.input)
+                if asyncio.iscoroutine(raw):
+                    raw = await raw
+                result = AgentResult.coerce(raw)
+                latency = (time.monotonic() - start) * 1000
+                return idx, result, latency, None
+            except Exception as exc:
+                latency = (time.monotonic() - start) * 1000
+                return idx, AgentResult(response=""), latency, str(exc)
+
+    agent_tasks = [call_agent_one(i) for i in range(n)]
+    agent_results = await asyncio.gather(*agent_tasks)
+    # Index by original position
+    agent_by_idx = {r[0]: r for r in agent_results}
+
+    # --- Stage 2: Grade all responses ---
+    async def grade_one(idx: int) -> Run:
+        _, agent_result, latency_ms, agent_error = agent_by_idx[idx]
+        sample = dataset[idx]
+        async with sem:
+            if agent_error:
+                return Run(
+                    sample_id=sample.id,
+                    query=sample.input,
+                    answer=sample.target,
+                    response="",
+                    reward=0.0,
+                    latency_ms=latency_ms,
+                    error=agent_error,
+                )
+
+            response = agent_result.response
+            tool_trace = agent_result.tool_trace
+            sample_metadata = sample.metadata or {}
+            state = {
+                "query": sample.input,
+                "answer": sample.target,
+                "completion": [{"role": "assistant", "content": response}],
+                "info": {
+                    "rubrics": [{"name": r.name, "criteria": r.criteria, "weight": r.weight} for r in sample.rubrics],
+                    "tool_trace": tool_trace,
+                    "attachments": sample_metadata.get("attachments", []),
+                },
+                "prompt": [{"role": "user", "content": sample.input}],
+                "index": idx,
+            }
+
+            try:
+                reward = await grader.score(state, mcp_urls=mcp_urls)
+                run = Run(
+                    sample_id=sample.id,
+                    query=sample.input,
+                    answer=sample.target,
+                    response=response,
+                    reward=reward,
+                    latency_ms=latency_ms,
+                    metadata={
+                        "grader_result": state.get("grader_result"),
+                        "tool_trace": tool_trace,
+                    },
+                )
+            except Exception as exc:
+                run = Run(
+                    sample_id=sample.id,
+                    query=sample.input,
+                    answer=sample.target,
+                    response=response,
+                    reward=0.0,
+                    latency_ms=latency_ms,
+                    error=str(exc),
+                    metadata={"tool_trace": tool_trace},
+                )
+
             if platform_client and live_run_id:
                 try:
                     await asyncio.to_thread(
                         platform_client.append_evaluation_result,
-                        live_run_id, run, len(dataset),
+                        live_run_id, run, n,
                     )
                 except Exception:
                     pass
             return run
 
-    tasks = [eval_one(i) for i in range(len(dataset))]
-    runs = await asyncio.gather(*tasks)
+    grade_tasks = [grade_one(i) for i in range(n)]
+    runs = await asyncio.gather(*grade_tasks)
     return EvaluationResult(list(runs), dataset, config)
-
-
-async def evaluate_single(
-    idx: int,
-    dataset: Dataset,
-    grader: Grader,
-    agent: AgentCallable,
-    config: EvalConfig,
-    mcp_urls: list[str],
-) -> Run:
-    sample = dataset[idx]
-    start_time = time.monotonic()
-
-    try:
-        raw_result = agent(sample.input)
-        if asyncio.iscoroutine(raw_result):
-            raw_result = await raw_result
-
-        agent_result = AgentResult.coerce(raw_result)
-        response = agent_result.response
-        tool_trace = agent_result.tool_trace
-        latency_ms = (time.monotonic() - start_time) * 1000
-
-        sample_metadata = sample.metadata or {}
-        state = {
-            "query": sample.input,
-            "answer": sample.target,
-            "completion": [{"role": "assistant", "content": response}],
-            "info": {
-                "rubrics": [{"name": r.name, "criteria": r.criteria, "weight": r.weight} for r in sample.rubrics],
-                "tool_trace": tool_trace,
-                "attachments": sample_metadata.get("attachments", []),
-            },
-            "prompt": [{"role": "user", "content": sample.input}],
-            "index": idx,
-        }
-
-        reward = await grader.score(state, mcp_urls=mcp_urls)
-
-        return Run(
-            sample_id=sample.id,
-            query=sample.input,
-            answer=sample.target,
-            response=response,
-            reward=reward,
-            latency_ms=latency_ms,
-            metadata={
-                "grader_result": state.get("grader_result"),
-                "tool_trace": tool_trace,
-            },
-        )
-    except Exception as exc:
-        latency_ms = (time.monotonic() - start_time) * 1000
-        return Run(
-            sample_id=sample.id,
-            query=sample.input,
-            answer=sample.target,
-            response="",
-            reward=0.0,
-            latency_ms=latency_ms,
-            error=str(exc),
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -426,3 +504,39 @@ def complete_live_run(
         client.complete_evaluation(run_id, summary=summary, failed=failed, progress=progress)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Internal: HTML report card
+# ---------------------------------------------------------------------------
+
+def _run_card(run: Run, pass_threshold: float) -> str:
+    """Render a single run as an HTML card for the report."""
+    passed = run.reward >= pass_threshold and not run.error
+    status = "PASS" if passed else "FAIL"
+    status_class = "ok" if passed else "fail"
+    grader_result = (run.metadata or {}).get("grader_result") or {}
+    tool_trace = (run.metadata or {}).get("tool_trace") or []
+    rubric_scores = grader_result.get("rubric_scores", [])
+    grader_reasoning = grader_result.get("grader_reasoning", "")
+
+    rubric_lines = "\n".join(
+        f'<div class="rubric"><b>{html.escape(s.get("rubric_name", ""))}</b>: '
+        f'score={s.get("score", 0):.2f} — {html.escape(s.get("reasoning", ""))}</div>'
+        for s in rubric_scores
+    ) if rubric_scores else "<div class='rubric'>No rubric scores</div>"
+
+    trace_json = json.dumps(tool_trace, indent=2, default=str)
+
+    return f"""<div class="run">
+  <h3><span class="{status_class}">{status}</span> {html.escape(run.sample_id)} · reward={run.reward:.2f}</h3>
+  <p><b>Query:</b> {html.escape(run.query)}</p>
+  <p><b>Answer:</b> {html.escape(run.answer or "N/A")}</p>
+  <p><b>Response:</b> {html.escape(run.response or "[empty]")}</p>
+  {f'<p class="fail"><b>Error:</b> {html.escape(run.error)}</p>' if run.error else ''}
+  <h4>Rubric Scores</h4>
+  {rubric_lines}
+  {f'<p><b>Grader reasoning:</b> {html.escape(grader_reasoning)}</p>' if grader_reasoning else ''}
+  <h4>Tool Trace</h4>
+  <pre>{html.escape(trace_json)}</pre>
+</div>"""
