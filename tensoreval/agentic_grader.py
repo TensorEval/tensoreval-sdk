@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import re
 import os
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,6 +13,12 @@ from tensoreval.types import Sample
 
 @dataclass
 class AgenticGrader:
+    """Grades agent responses against rubrics.
+
+    When a provider (OpenAI, Anthropic, etc.) is configured, the grader uses
+    a multi-turn tool loop with MCP access to verify claims.  Without a
+    provider, it falls back to heuristic reference-answer matching.
+    """
     model: str | None = None
     provider: str | None = None
     api_key: str | None = None

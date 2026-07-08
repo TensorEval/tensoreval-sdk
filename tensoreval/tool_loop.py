@@ -6,13 +6,22 @@ import json
 import os
 import re
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from tensoreval.errors import APIError, AuthenticationError, RateLimitError
+
 
 @dataclass
 class ProviderConfig:
+    """Connection settings for an LLM provider.
+
+    Use ``ProviderConfig.from_name("openai")`` (or ``"anthropic"``,
+    ``"openrouter"``, ``"ollama"``) to get sensible defaults resolved from
+    environment variables.
+    """
     provider: str
     model: str
     api_key: str = ""
@@ -115,6 +124,7 @@ class MCPRegistry:
 
 
 class ToolLoopAgent:
+    """Multi-turn LLM loop that can call MCP tools to verify, then returns structured JSON."""
     def __init__(
         self,
         provider: ProviderConfig,
@@ -316,5 +326,17 @@ def _post_json(
         headers=headers or {"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode())
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        err_body = ""
+        try:
+            err_body = exc.read().decode()
+        except Exception:
+            pass
+        if exc.code == 401:
+            raise AuthenticationError(f"HTTP 401 from {url}: {err_body}") from exc
+        if exc.code == 429:
+            raise RateLimitError(f"HTTP 429 from {url}: {err_body}") from exc
+        raise APIError(f"HTTP {exc.code} from {url}: {err_body}") from exc

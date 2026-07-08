@@ -10,6 +10,11 @@ from typing import Any
 
 @dataclass
 class Env:
+    """Runtime environment for an evaluation — where the agent lives and what tools it can reach.
+
+    Construct via ``from_endpoint`` (remote HTTP), ``from_dockerfile`` (local container),
+    or ``from_yaml`` (config file).  ``from_registry`` is reserved for future use.
+    """
     kind: str
     agent_url: str | None = None
     mcp_urls: list[str] = field(default_factory=list)

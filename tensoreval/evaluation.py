@@ -2,21 +2,25 @@
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import time
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
 
 from tensoreval.agentic_grader import AgenticGrader
+from tensoreval.client import DashboardClient
 from tensoreval.dataset import Dataset
 from tensoreval.env import Env
 
 
 @dataclass
 class EvaluationRun:
+    """Result of evaluating a single sample — agent response, grade, and traces."""
+
     sample_id: str
     query: str
     final_response: str
@@ -32,6 +36,12 @@ class EvaluationRun:
 
 @dataclass
 class EvaluationResult:
+    """Aggregate results from an evaluation run.
+
+    Provides ``summary()``, ``recommendations()``, ``report()`` (HTML),
+    and ``save()``/``load()`` for JSON persistence.
+    """
+
     runs: list[EvaluationRun]
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -102,8 +112,31 @@ class EvaluationResult:
         path.write_text(body, encoding="utf-8")
         return str(path)
 
+    def save(self, path: str | Path) -> None:
+        """Serialize the evaluation result to a JSON file."""
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "runs": [asdict(run) for run in self.runs],
+            "metadata": self.metadata,
+        }, indent=2, default=str), encoding="utf-8")
+
+    @classmethod
+    def load(cls, path: str | Path) -> "EvaluationResult":
+        """Load an evaluation result from a JSON file."""
+        path = Path(path)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        runs = [EvaluationRun(**run) for run in data.get("runs", [])]
+        return cls(runs=runs, metadata=data.get("metadata", {}))
+
 
 class Evaluation:
+    """Entry point for running an evaluation.
+
+    Call ``Evaluation.run(dataset, env, grader)`` to evaluate an agent
+    across a dataset with concurrent workers and optional live dashboard updates.
+    """
+
     @staticmethod
     def run(
         dataset: Dataset,
@@ -114,58 +147,146 @@ class Evaluation:
         agent_config: dict[str, Any] | None = None,
     ) -> EvaluationResult:
         if env.kind != "endpoint":
-            raise NotImplementedError("Only endpoint environments are implemented in this cleanup pass")
-        if workers != 1 and not env.supports_parallel_workers:
-            raise ValueError("Endpoint environments must run with workers=1")
+            raise NotImplementedError(f"Environment kind '{env.kind}' is not supported — use Env.from_endpoint()")
 
         grader = grader or AgenticGrader()
-        runs = [_run_one(sample, env, grader, timeout, agent_config or {}) for sample in dataset]
-        return EvaluationResult(
-            runs=runs,
-            metadata={"env": {"kind": env.kind, "agent_url": env.agent_url, "mcp_urls": env.mcp_urls}},
-        )
+        dashboard = DashboardClient()
+        dashboard_run_id = _start_dashboard(dashboard, env, len(dataset))
+
+        try:
+            runs = asyncio.run(_grade_samples(
+                dataset, env, grader, timeout, agent_config or {}, workers, dashboard, dashboard_run_id,
+            ))
+            result = EvaluationResult(
+                runs=runs,
+                metadata={"env": {"kind": env.kind, "agent_url": env.agent_url, "mcp_urls": env.mcp_urls}},
+            )
+            _finish_dashboard(dashboard, dashboard_run_id, result.summary())
+            return result
+        except Exception:
+            _finish_dashboard(dashboard, dashboard_run_id, failed=True)
+            raise
 
 
-def _run_one(sample: Any, env: Env, grader: AgenticGrader, timeout: float, agent_config: dict[str, Any]) -> EvaluationRun:
+async def _grade_samples(
+    dataset: Dataset,
+    env: Env,
+    grader: AgenticGrader,
+    timeout: float,
+    agent_config: dict[str, Any],
+    workers: int,
+    dashboard: DashboardClient,
+    dashboard_run_id: str | None,
+) -> list[EvaluationRun]:
+    """Run agent calls and grading concurrently across all samples."""
+    semaphore = asyncio.Semaphore(max(1, workers))
+
+    async def grade_one(sample: Any) -> EvaluationRun:
+        async with semaphore:
+            return await asyncio.to_thread(_evaluate_sample, sample, env, grader, timeout, agent_config)
+
+    results: list[EvaluationRun] = []
+    for coro in asyncio.as_completed([grade_one(s) for s in dataset]):
+        run = await coro
+        if dashboard.enabled and dashboard_run_id:
+            dashboard.append_result(dashboard_run_id, _run_to_payload(run), total_count=len(dataset))
+        results.append(run)
+    return results
+
+
+def _start_dashboard(dashboard: DashboardClient, env: Env, total_count: int) -> str | None:
+    """Start a live evaluation run on the dashboard if enabled."""
+    if not dashboard.enabled:
+        return None
+    return dashboard.start_evaluation(
+        model=env.config.get("model", "default"),
+        total_count=total_count,
+        name=f"SDK: {env.config.get('model', 'default')}",
+    )
+
+
+def _finish_dashboard(
+    dashboard: DashboardClient,
+    run_id: str | None,
+    summary: dict[str, Any] | None = None,
+    failed: bool = False,
+) -> None:
+    """Mark the dashboard evaluation as complete or failed."""
+    if dashboard.enabled and run_id:
+        dashboard.complete_evaluation(run_id, summary=summary, failed=failed)
+
+
+def _run_to_payload(run: EvaluationRun) -> dict[str, Any]:
+    """Convert an EvaluationRun to the dashboard ingest API format."""
+    return {
+        "sample_id": run.sample_id,
+        "query": run.query,
+        "response": run.final_response,
+        "reward": run.reward,
+        "latency_ms": run.latency_ms,
+        "error": run.error,
+        "metadata": {
+            "grader_result": {
+                "rubric_scores": run.rubric_scores,
+                "grader_reasoning": run.reasoning,
+            },
+        },
+    }
+
+
+def _evaluate_sample(
+    sample: Any,
+    env: Env,
+    grader: AgenticGrader,
+    timeout: float,
+    agent_config: dict[str, Any],
+) -> EvaluationRun:
+    """Call the agent and grade its response for a single sample."""
     started = time.monotonic()
     try:
-        payload = {
-            "model": env.config.get("model", "default"),
-            "messages": [{"role": "user", "content": sample.query}],
-            "agent_config": agent_config,
-            "metadata": {"sample_id": sample.id},
-        }
-        if env.mcp_urls:
-            payload["mcp_servers"] = env.mcp_servers()
-
-        response = _post_json(env.agent_url or "", payload, timeout)
+        response = _post_json(
+            env.agent_url or "",
+            _build_agent_payload(sample, env, agent_config),
+            timeout,
+        )
         final_response = _extract_final_response(response)
         trace = response.get("trace") if isinstance(response.get("trace"), dict) else None
         grade = grader.grade(sample, final_response, agent_trace=trace, mcp_urls=env.mcp_urls)
-        latency_ms = (time.monotonic() - started) * 1000
         return EvaluationRun(
             sample_id=sample.id,
             query=sample.query,
             final_response=final_response,
             reward=grade["reward"],
             passed=grade["passed"],
-            latency_ms=latency_ms,
+            latency_ms=(time.monotonic() - started) * 1000,
             trace=trace,
             grader_trace=grade.get("grader_trace"),
             rubric_scores=grade["rubric_scores"],
             reasoning=grade["reasoning"],
         )
     except Exception as exc:
-        latency_ms = (time.monotonic() - started) * 1000
         return EvaluationRun(
             sample_id=sample.id,
             query=sample.query,
             final_response="",
             reward=0.0,
             passed=False,
-            latency_ms=latency_ms,
+            latency_ms=(time.monotonic() - started) * 1000,
             error=str(exc),
         )
+
+
+def _build_agent_payload(sample: Any, env: Env, agent_config: dict[str, Any]) -> dict[str, Any]:
+    """Build the request body for calling the agent endpoint."""
+    payload: dict[str, Any] = {
+        "model": env.config.get("model", "default"),
+        "messages": [{"role": "user", "content": sample.query}],
+        "agent_config": agent_config,
+        "metadata": {"sample_id": sample.id},
+    }
+    if env.mcp_urls:
+        payload["mcp_servers"] = env.mcp_servers()
+    return payload
 
 
 def _post_json(url: str, body: dict[str, Any], timeout: float) -> dict[str, Any]:
