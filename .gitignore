@@ -29,6 +29,11 @@ Thumbs.db
 # Logs
 *.log
 
-# Test results (keep examples/ versions)
+# Test / eval results
+tests/results/
 test_results.json
 customer_support_results.json
+examples/customer_support/results.json
+examples/customer_support/results_summary.txt
+examples/customer_support/eval_log.txt
+examples/customer_support/report.html
