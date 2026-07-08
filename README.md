@@ -1,271 +1,247 @@
 # TensorEval SDK
 
-**Evaluation SDK for AI Agents — Docker, MCP, Voice, and more.**
+Minimal evaluation SDK for black-box agents.
+
+TensorEval sends one OpenAI-shaped request to an agent endpoint, waits for a
+response, extracts the final answer, grades it, and writes a report. Tool traces
+are optional: if the agent returns `trace.steps`, the report includes them.
 
 ## Quick Start
 
-```bash
-pip install git+https://github.com/TensorEval/tensoreval-sdk.git
-```
-
 ```python
 import tensoreval as te
 
-# Load dataset
-ds = te.Datasets.load_from_file("tasks.jsonl")
+env = te.Env.from_endpoint(
+    agent_url="http://localhost:8000/v1/chat/completions",
+    mcp_urls=["http://localhost:8001/mcp"],  # optional
+)
 
-# Create grader
-grader = te.RubricGrader()
+dataset = te.Dataset.from_jsonl("tasks.jsonl")
+grader = te.AgenticGrader(
+    provider="openai",
+    model="gpt-4.1",
+    api_key="sk-...",
+    pass_threshold=0.8,
+)
 
-# Run evaluation against your agent
-results = te.Evaluation.run(ds, grader, agent_port=8000)
-print(results.summary())
+result = te.Evaluation.run(
+    dataset=dataset,
+    env=env,
+    grader=grader,
+    workers=1,
+    timeout=300,
+    agent_config={"max_steps": 20, "mode": "eval"},
+)
+
+print(result.summary())
+result.report("report.html")
 ```
 
-## Features
+If no provider config is passed, TensorEval uses local heuristic grading unless
+`TENSOREVAL_GRADER_API_KEY` is set. With a grader API key, `AgenticGrader`
+defaults to OpenAI `gpt-4.1`.
 
-| Feature | Status | Description |
-|---------|--------|-------------|
-| **Docker Compose** | Working | Run agent in container, evaluate automatically |
-| **Agent Endpoint** | Working | Test any HTTP endpoint (OpenAI-compatible) |
-| **MCP Tools** | Working | Connect to MCP servers for tool access |
-| **RubricGrader** | Working | Rule-based scoring with weighted rubrics |
-| **AgentGrader** | Working | LLM reads rubrics and judges each one |
-| **RulerGrader** | Working | Zero-config relative ranking |
-| **Voice Metrics** | Working | TTFT, WPM, latency tracking |
-| **Auto-generation** | Working | Generate tests from agent description |
-| **Persistence** | Working | Save/load results to JSON |
-| **Real API Tested** | Working | Tested with Mimo v2.5 Pro |
+## Agent Endpoint Contract
 
-## Usage Examples
+The endpoint receives an OpenAI-shaped request plus TensorEval metadata.
 
-### 1. Evaluate with RubricGrader (simple answer matching)
+```json
+{
+  "model": "default",
+  "messages": [
+    {"role": "user", "content": "Refund order O123"}
+  ],
+  "agent_config": {
+    "max_steps": 20,
+    "mode": "eval"
+  },
+  "metadata": {
+    "sample_id": "case_001"
+  },
+  "mcp_servers": [
+    {"name": "mcp_0", "url": "http://localhost:8001/mcp"}
+  ]
+}
+```
+
+`agent_config` is passed through unchanged. TensorEval only uses `timeout` as
+the HTTP request timeout.
+
+## Accepted Responses
+
+Preferred response:
+
+```json
+{
+  "choices": [
+    {
+      "message": {
+        "role": "assistant",
+        "content": "Order O123 is eligible for refund."
+      }
+    }
+  ]
+}
+```
+
+TensorEval also accepts common final-output fields:
+
+```json
+{"final_response": "..."}
+{"output_text": "..."}
+{"answer": "..."}
+{"response": "..."}
+{"output": "..."}
+{"result": "..."}
+```
+
+## Optional Trace Schema
+
+Agents can return traces for richer reports:
+
+```json
+{
+  "choices": [
+    {"message": {"role": "assistant", "content": "Refund approved."}}
+  ],
+  "trace": {
+    "schema_version": "tensoreval.trace.v1",
+    "steps": [
+      {
+        "id": "s1",
+        "type": "message",
+        "role": "assistant",
+        "content": "Checking the order."
+      },
+      {
+        "id": "s2",
+        "type": "tool_call",
+        "name": "lookup_order",
+        "arguments": {"order_id": "O123"},
+        "mcp_server": "mcp_0"
+      },
+      {
+        "id": "s3",
+        "type": "tool_result",
+        "tool_call_id": "s2",
+        "name": "lookup_order",
+        "result": {"status": "delivered"},
+        "is_error": false
+      }
+    ]
+  }
+}
+```
+
+Supported step types:
+
+```text
+message
+tool_call
+tool_result
+reasoning_summary
+artifact
+error
+```
+
+Do not return hidden chain-of-thought. Use `reasoning_summary` only for safe,
+agent-provided summaries.
+
+## Agentic Grader
+
+`AgenticGrader` is a grader-side tool loop. It receives the query, final
+response, rubrics, reference answer, optional agent trace, and the same
+`mcp_urls` configured on the environment. It can call those MCP tools while
+grading.
 
 ```python
-import tensoreval as te
-
-ds = te.Datasets.load_from_dict([
-    {"query": "What is 2+2?", "reference_answer": "4"},
-    {"query": "What is 10*5?", "reference_answer": "50"},
-])
-
-grader = te.RubricGrader()
-env = te.Env.from_dict({"system_prompt": "Answer concisely."})
-
-results = te.Evaluation.run(ds, grader, env=env, model="mimo-v2.5-pro", api_key="...", base_url="...")
-print(results.summary())
+grader = te.AgenticGrader(
+    provider="openai",        # openai | anthropic | ollama | openrouter
+    model="gpt-4.1",
+    api_key="sk-...",
+    base_url=None,
+    instructions="Grade using rubrics, trace, reference answer, and MCP state.",
+    max_steps=10,
+    timeout=120,
+    temperature=0,
+)
 ```
 
-### 2. Evaluate with AgentGrader (LLM judges rubrics)
+Supported providers:
+
+```text
+openai      -> https://api.openai.com/v1/chat/completions
+openrouter  -> https://openrouter.ai/api/v1/chat/completions
+ollama      -> http://localhost:11434/v1/chat/completions
+anthropic   -> https://api.anthropic.com/v1/messages
+```
+
+OpenAI, OpenRouter, and Ollama use an OpenAI-compatible tool-call loop.
+Anthropic uses the Messages API tool-use format.
+
+The grader returns:
+
+```json
+{
+  "reward": 0.9,
+  "passed": true,
+  "rubric_scores": {
+    "correctness": {"score": 0.9, "reason": "Verified with order state."}
+  },
+  "reasoning_summary": "The answer matches policy and tool state.",
+  "grader_trace": {
+    "steps": [
+      {"type": "tool_call", "name": "lookup_order", "arguments": {"order_id": "O123"}},
+      {"type": "tool_result", "name": "lookup_order", "result": {"status": "delivered"}}
+    ]
+  }
+}
+```
+
+## Dataset Format
+
+`query` is required. Rubrics and reference answers are optional.
+
+```json
+{
+  "id": "case_001",
+  "query": "Refund order O123",
+  "reference_answer": "Refund approved",
+  "rubrics": [
+    {
+      "id": "correctness",
+      "description": "Must approve eligible refund",
+      "weight": 1.0
+    }
+  ],
+  "setup_script": "",
+  "verify_script": "",
+  "metadata": {}
+}
+```
+
+Load it:
 
 ```python
-ds = te.Datasets.load_from_dict([{
-    "query": "Customer wants refund for order delivered 10 days ago",
-    "reference_answer": "Issue refund of $49.99",
-    "rubrics": [
-        {"name": "policy", "criteria": "Must verify within 30-day window", "weight": 0.4},
-        {"name": "empathy", "criteria": "Must show empathy", "weight": 0.3},
-        {"name": "action", "criteria": "Must state refund amount", "weight": 0.3},
-    ],
-}])
-
-grader = te.AgentGrader(model="mimo-v2.5-pro", api_key="...", base_url="...")
-results = te.Evaluation.run(ds, grader, env=env, model="mimo-v2.5-pro", api_key="...", base_url="...")
+dataset = te.Dataset.from_jsonl("tasks.jsonl")
 ```
 
-### 3. Evaluate with Docker (agent runs in container)
+## Public API
 
 ```python
-ds = te.Datasets.load_from_file("tasks.jsonl")
-grader = te.RubricGrader()
+te.Env.from_endpoint(agent_url, mcp_urls=None)
+te.Env.from_dockerfile(path="Dockerfile", agent_port=8000, mcp_ports=None)
+te.Env.from_yaml("tensoreval.yaml")
+te.Env.from_registry("browseros")  # reserved
 
-env = te.Env.from_dict({
-    "system_prompt": "You are a support agent.",
-    "agent": {
-        "image": "python:3.12-slim",
-        "command": "python /app/agent.py",
-        "port": 8000,
-        "volumes": ["./my_agent:/app"],
-    },
-})
+te.Dataset.from_jsonl("tasks.jsonl")
+te.Dataset.from_dicts([...])
 
-results = te.Evaluation.run(ds, env, grader, agent_port=8000)
+te.AgenticGrader(...)
+te.ProviderConfig.from_name("openai")
+te.Evaluation.run(...)
+te.EvaluationResult.report("report.html")
 ```
 
-### 4. Evaluate with agent endpoint (no Docker)
-
-```python
-ds = te.Datasets.load_from_file("tasks.jsonl")
-grader = te.RubricGrader()
-
-results = te.Evaluation.run(ds, grader, agent_port=8000)
-```
-
-### 5. RULER zero-config (no rubrics needed)
-
-```python
-ds = te.Datasets.load_from_dict([
-    {"query": "Explain quantum computing"},
-    {"query": "Write a haiku about programming"},
-])
-
-grader = te.RulerGrader(model="mimo-v2.5-pro", api_key="...", base_url="...")
-results = te.Evaluation.run(ds, grader, env=env, model="mimo-v2.5-pro", api_key="...", base_url="...")
-```
-
-### 6. Save and load results
-
-```python
-results.save("results.json")
-loaded = te.EvaluationResult.load("results.json")
-print(loaded.summary())
-```
-
-## Docker Compose
-
-```python
-compose = te.DockerCompose(services={
-    "agent": {
-        "image": "my-agent:latest",
-        "port": 8000,
-        "env": {"OPENAI_API_KEY": "sk-..."},
-        "volumes": ["./code:/app"],
-    },
-    "mcp-server": {
-        "image": "my-mcp:latest",
-        "port": 9000,
-    },
-})
-
-ports = await compose.up()
-# agent at localhost:8000, mcp at localhost:9000
-await compose.down()
-```
-
-## MCP Integration
-
-```python
-server = te.MCPServer(url="http://localhost:9000/mcp", name="my-tools")
-registry = te.MCPToolRegistry()
-registry.add_server("cx_app", server)
-```
-
-## Built-in Environments
-
-```python
-# Load from HuggingFace
-ds = te.Datasets.from_huggingface("gsm8k", split="test", n=10)
-
-# Load from dict
-ds = te.Datasets.load_from_dict([{"query": "...", "reference_answer": "..."}])
-
-# Load from file
-ds = te.Datasets.load_from_file("tasks.jsonl")
-```
-
-## Test Results
-
-### Math Evaluation (Mimo v2.5 Pro)
-```
-Q01: 12 * 15?                    -> 180      [PASS]
-Q02: 24 + 36?                    -> 60       [PASS]
-Q03: 100 / 4?                    -> 25       [PASS]
-Q04: 7 * 8?                      -> 56       [PASS]
-Q05: 15% of 200?                 -> 30       [PASS]
-Avg Reward: 1.0 | Pass Rate: 100%
-```
-
-### Customer Support (21 scenarios, AgentGrader)
-```
-Billing:       75% pass
-Security:      100% pass
-Policy:        100% pass
-Account:       67% pass
-Technical:     25% pass
-Avg Reward: 0.74 | Pass Rate: 57%
-```
-
-### Voice Pipeline (TTS -> ASR -> LLM)
-```
-Q1: "What is 12 * 15?" -> Audio -> Transcribe -> "180" [PASS]
-Q2: "3 items at $25"    -> Audio -> Transcribe -> "75"  [PASS]
-Q3: "15% of 200"       -> Audio -> Transcribe -> "30"  [PASS]
-Avg Reward: 1.0 | Pass Rate: 100%
-```
-
-### Docker Compose
-```
-Container started on port 8002
-Agent ready
-Q1: What is 2+2? -> 4 [PASS]
-Q2: What is 12*15? -> 180 [PASS]
-Q3: What is 10*5? -> 50 [PASS]
-Q4: What is 100/4? -> 25 [PASS]
-Avg Reward: 1.0 | Pass Rate: 100%
-```
-
-## API Reference
-
-### Core Classes
-
-| Class | Purpose |
-|-------|---------|
-| `te.Env` | Environment config + Docker lifecycle |
-| `te.Datasets` | Load datasets from file/dict/HuggingFace |
-| `te.RubricGrader` | Rule-based scoring |
-| `te.AgentGrader` | LLM-as-judge scoring |
-| `te.RulerGrader` | Zero-config relative ranking |
-| `te.Evaluation` | Run evaluations |
-| `te.EvaluationResult` | Results with summary/save/load |
-| `te.DockerCompose` | Docker compose manager |
-| `te.MCPServer` | MCP server client |
-
-### Evaluation.run() Signature
-
-```python
-te.Evaluation.run(
-    datasets: Datasets,           # Test cases
-    env: Env = None,              # Environment config
-    grader: Grader = None,        # Scorer (default: RubricGrader)
-    model: str = "mimo-v2.5-pro", # Model name
-    api_key: str = None,          # API key
-    base_url: str = None,         # API base URL
-    workers: int = 4,             # Concurrent workers
-    agent_port: int = None,       # Agent endpoint port
-    mcp_port: int = None,         # MCP server port
-    system_prompt: str = None,    # System prompt (overrides env)
-    output: str = None,           # Save results to file
-) -> EvaluationResult
-```
-
-## Repository Structure
-
-```
-tensoreval-sdk/
-├── tensoreval/              # SDK source
-│   ├── __init__.py
-│   ├── env.py               # Env config + Docker lifecycle
-│   ├── datasets.py          # Dataset loading
-│   ├── evaluation.py        # Evaluation runner
-│   ├── docker_compose.py    # Docker compose manager
-│   ├── enums.py             # EnvType, Modality, GraderType
-│   ├── mcp_tools.py         # MCP server/client
-│   ├── graders/             # RubricGrader, AgentGrader, RulerGrader
-│   ├── voice/               # Voice metrics
-│   └── utils/               # Helpers
-├── tests/                   # Unit tests (11 passing)
-├── examples/
-│   ├── scripts/             # Test scripts
-│   ├── scenarios/           # Test scenarios
-│   ├── results/             # Test results
-│   └── user_agent/          # Example user agent with Docker
-├── INTEGRATION.md           # How to use in your repo
-├── REPORT.md                # Customer support evaluation report
-└── README.md                # This file
-```
-
-## Links
-
-- **GitHub:** https://github.com/TensorEval/tensoreval-sdk
-- **Integration Guide:** [INTEGRATION.md](INTEGRATION.md)
-- **Evaluation Report:** [examples/REPORT.md](examples/REPORT.md)
+`workers > 1` is reserved for Docker-backed isolated environments. Endpoint
+environments run with `workers=1`.
