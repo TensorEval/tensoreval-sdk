@@ -38,7 +38,6 @@ from tensoreval.evaluation import Evaluation, EvaluationResult
 
 # Graders
 from tensoreval.graders.agent_grader import AgentGrader, VercelAgentGrader
-from tensoreval.graders.verification_grader import VerificationGrader
 
 # Agents
 from tensoreval.agents import (
@@ -83,7 +82,7 @@ __all__ = [
     # Core
     "Datasets", "Evaluation", "EvaluationResult",
     # Graders
-    "AgentGrader", "VercelAgentGrader", "VerificationGrader",
+    "AgentGrader", "VercelAgentGrader",
     # Agents
     "Agent", "Context", "FunctionAgent", "OpenAIAgent",
     # Environment
