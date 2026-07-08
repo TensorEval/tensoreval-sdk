@@ -44,9 +44,6 @@ from tensoreval.grader import Grader
 # Environment (Docker + MCP config)
 from tensoreval.env import Environment
 
-# MCP tools
-from tensoreval.mcp import LocalTool, MCPServer, MCPRegistry, tool
-
 # Docker
 from tensoreval.docker import DockerCompose
 
@@ -65,8 +62,6 @@ __all__ = [
     "Dataset", "Evaluation", "EvaluationResult", "Grader",
     # Environment
     "Environment", "DockerCompose",
-    # MCP
-    "LocalTool", "MCPServer", "MCPRegistry", "tool",
     # Utilities
     "extract_boxed_answer", "extract_hash_answer",
     # Platform client

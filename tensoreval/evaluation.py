@@ -243,7 +243,6 @@ class Evaluation:
             except Exception as exc:
                 print(f"[tensoreval] warning: env.start() failed: {exc}", file=sys.stderr)
 
-        mcp_registry = build_mcp_registry(config, env)
         mcp_urls = extract_mcp_urls(config, env)
 
         # Live dashboard updates (if TENSOREVAL_API_KEY is set)
@@ -251,7 +250,7 @@ class Evaluation:
 
         try:
             results = await run_eval(
-                dataset, grader, agent, config, mcp_registry, mcp_urls,
+                dataset, grader, agent, config, mcp_urls,
                 platform_client, live_run_id,
             )
             complete_live_run(platform_client, live_run_id, results.summary().to_dict())
@@ -291,7 +290,6 @@ async def run_eval(
     grader: Grader,
     agent: AgentCallable,
     config: EvalConfig,
-    mcp_registry: Any = None,
     mcp_urls: list[str] | None = None,
     platform_client: Any = None,
     live_run_id: str | None = None,
@@ -299,17 +297,9 @@ async def run_eval(
     sem = asyncio.Semaphore(config.workers)
     mcp_urls = mcp_urls or []
 
-    mcp_tools: list[dict[str, Any]] = []
-    if mcp_registry:
-        try:
-            await mcp_registry.list_all_tools()
-            mcp_tools = mcp_registry.to_openai_tools()
-        except Exception:
-            pass
-
     async def eval_one(idx: int) -> Run:
         async with sem:
-            run = await evaluate_single(idx, dataset, grader, agent, config, mcp_tools, mcp_registry, mcp_urls)
+            run = await evaluate_single(idx, dataset, grader, agent, config, mcp_urls)
             if platform_client and live_run_id:
                 try:
                     await asyncio.to_thread(
@@ -331,8 +321,6 @@ async def evaluate_single(
     grader: Grader,
     agent: AgentCallable,
     config: EvalConfig,
-    mcp_tools: list[dict[str, Any]],
-    mcp_registry: Any,
     mcp_urls: list[str],
 ) -> Run:
     sample = dataset[idx]
@@ -355,12 +343,9 @@ async def evaluate_single(
             "completion": [{"role": "assistant", "content": response}],
             "info": {
                 "rubrics": [{"name": r.name, "criteria": r.criteria, "weight": r.weight} for r in sample.rubrics],
-                "mcp_tools": mcp_tools,
                 "tool_trace": tool_trace,
                 "attachments": sample_metadata.get("attachments", []),
             },
-            "tools": mcp_tools,
-            "tool_registry": mcp_registry,
             "prompt": [{"role": "user", "content": sample.input}],
             "index": idx,
         }
@@ -393,57 +378,8 @@ async def evaluate_single(
 
 
 # ---------------------------------------------------------------------------
-# Internal: MCP registry
+# Internal: MCP URL extraction
 # ---------------------------------------------------------------------------
-
-def build_mcp_registry(config: EvalConfig, env: Any = None) -> Any:
-    from tensoreval.mcp import MCPServer, MCPRegistry
-
-    registry = MCPRegistry()
-
-    for tool_fn in getattr(config, "tools", None) or []:
-        if callable(tool_fn):
-            registry.add_local_tool(tool_fn)
-
-    server_specs: list[Any] = []
-    if config.mcp_servers:
-        server_specs.extend(config.mcp_servers if isinstance(config.mcp_servers, list) else [config.mcp_servers])
-    if env is not None and getattr(env, "mcp_servers", None):
-        server_specs.extend(env.mcp_servers if isinstance(env.mcp_servers, list) else [env.mcp_servers])
-    if env is not None and getattr(env, "mcp_url", None):
-        server_specs.append({"name": "default", "url": env.mcp_url})
-
-    seen_urls: set[str] = set()
-    for idx, spec in enumerate(server_specs):
-        server = mcp_server_from_spec(spec, idx)
-        if not server or not server.url or server.url in seen_urls:
-            continue
-        seen_urls.add(server.url)
-        registry.add_server(server.name or f"server_{idx + 1}", server)
-
-    if registry.local_tools or registry.servers:
-        return registry
-    return None
-
-
-def mcp_server_from_spec(spec: Any, idx: int) -> Any:
-    from tensoreval.mcp import MCPServer
-
-    if isinstance(spec, MCPServer):
-        return spec
-    if isinstance(spec, str):
-        return MCPServer(url=spec, name=f"server_{idx + 1}")
-    if isinstance(spec, dict):
-        url = str(spec.get("url") or spec.get("mcp_url") or "")
-        if not url:
-            return None
-        return MCPServer(
-            url=url,
-            name=str(spec.get("name") or f"server_{idx + 1}"),
-            auth_token=spec.get("auth_token") or spec.get("token"),
-        )
-    return None
-
 
 def extract_mcp_urls(config: EvalConfig, env: Any = None) -> list[str]:
     urls: list[str] = []

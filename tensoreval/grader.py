@@ -11,7 +11,7 @@ Two modes:
 
 Both modes use the OpenAI Chat Completions API via raw ``urllib`` —
 no external SDK dependencies. Any OpenAI-compatible endpoint works
-(Vercel AI Gateway, OpenAI, Azure, local vLLM, etc.).
+(OpenAI, Azure, local vLLM, etc.).
 
 Usage:
     from tensoreval import Grader
@@ -31,6 +31,7 @@ import asyncio
 import json
 import os
 import re
+import time
 import urllib.request
 import urllib.error
 from typing import Any
@@ -43,7 +44,7 @@ class Grader:
     """LLM-as-judge rubric grader.
 
     Args:
-        model: Model ID (e.g. ``"gpt-4o"``, ``"openai/gpt-5.5"``).
+        model: Model ID (e.g. ``"gpt-4o"``).
         api_key: API key. Falls back to ``OPENAI_API_KEY`` env var.
         base_url: OpenAI-compatible base URL. Defaults to OpenAI's API.
         fallback_on_error: If true, use simple reference-answer matching
@@ -179,8 +180,6 @@ class Grader:
         mcp_urls: list[str],
     ) -> dict[str, Any]:
         """Multi-turn LLM loop — judge calls MCP tools to verify, then scores."""
-        from tensoreval.mcp import run_verification_loop
-
         system_prompt = build_system_prompt(rubrics, bool(answer), attachments, has_mcp_tools=True)
         user_prompt = build_user_prompt(query_text, answer, response, rubrics, tool_trace, attachments)
 
@@ -202,6 +201,169 @@ class Grader:
             return parsed
 
         return await self.score_direct(query_text, answer, response, rubrics, tool_trace, attachments)
+
+
+# ---------------------------------------------------------------------------
+# MCP client — thin functions, no classes (urllib only)
+# ---------------------------------------------------------------------------
+
+def discover_mcp_tools(urls: list[str], timeout: float = 30.0) -> list[dict[str, Any]]:
+    """Discover tools from MCP servers. Returns OpenAI function-tool dicts.
+
+    Each tool dict has: name, description, parameters, server_url.
+    """
+    tools: list[dict[str, Any]] = []
+    for url in urls:
+        try:
+            data = post_json(url, {
+                "jsonrpc": "2.0", "id": 1,
+                "method": "tools/list", "params": {},
+            }, timeout=timeout)
+            for tool in data.get("result", {}).get("tools", []):
+                tools.append({
+                    "name": tool.get("name", ""),
+                    "description": tool.get("description", ""),
+                    "parameters": tool.get("inputSchema", {"type": "object", "properties": {}}),
+                    "server_url": url,
+                })
+        except Exception:
+            pass
+    return tools
+
+
+def call_mcp_tool(url: str, name: str, arguments: dict[str, Any], timeout: float = 30.0) -> Any:
+    """Call a tool on an MCP server. Returns the result dict."""
+    try:
+        data = post_json(url, {
+            "jsonrpc": "2.0", "id": 1,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        }, timeout=timeout)
+        result = data.get("result", {})
+        return result.get("content", result)
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def run_verification_loop(
+    *,
+    model: str,
+    api_key: str,
+    base_url: str,
+    system_prompt: str,
+    user_prompt: str,
+    mcp_urls: list[str],
+    max_turns: int = 10,
+    timeout: float = 120.0,
+    temperature: float = 0.0,
+) -> dict[str, Any]:
+    """Multi-turn LLM loop with MCP tool access for verification.
+
+    The LLM receives the system + user prompt, can call MCP tools to
+    verify claims, and returns structured JSON when done.
+
+    Returns:
+        Dict with keys:
+            - ``content``: final LLM text response
+            - ``grader_trace``: list of tool calls and results
+            - ``parsed``: parsed JSON from LLM output (or None)
+    """
+    # Discover tools from all MCP servers
+    discovered = discover_mcp_tools(mcp_urls, timeout=timeout)
+    openai_tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t["description"],
+                "parameters": t["parameters"],
+            },
+        }
+        for t in discovered
+    ]
+    # Map tool name → server URL for routing calls
+    tool_server_map = {t["name"]: t["server_url"] for t in discovered}
+
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    trace: list[dict[str, Any]] = []
+
+    for turn in range(max_turns):
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+        }
+        if openai_tools:
+            body["tools"] = openai_tools
+            body["tool_choice"] = "auto"
+
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        data = post_json(
+            f"{base_url.rstrip('/')}/chat/completions",
+            body, headers=headers, timeout=timeout,
+        )
+
+        message = data.get("choices", [{}])[0].get("message", {})
+        content = message.get("content") or ""
+        tool_calls = message.get("tool_calls") or []
+
+        if not tool_calls:
+            trace.append({"type": "final", "turn": turn, "content": content[:500]})
+            return {"content": content, "grader_trace": trace, "parsed": try_parse_json(content)}
+
+        messages.append({
+            "role": "assistant",
+            "content": content,
+            "tool_calls": [
+                {
+                    "id": tc.get("id", ""),
+                    "type": "function",
+                    "function": {
+                        "name": tc.get("function", {}).get("name", ""),
+                        "arguments": tc.get("function", {}).get("arguments", "{}"),
+                    },
+                }
+                for tc in tool_calls
+            ],
+        })
+
+        for tc in tool_calls:
+            fn = tc.get("function", {})
+            name = fn.get("name", "")
+            try:
+                args = json.loads(fn.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                args = {}
+
+            server_url = tool_server_map.get(name, "")
+            started = time.monotonic()
+            result = call_mcp_tool(server_url, name, args, timeout=timeout) if server_url else {"error": f"Tool not found: {name}"}
+            duration_ms = (time.monotonic() - started) * 1000
+
+            trace.append({
+                "type": "tool_call",
+                "turn": turn,
+                "name": name,
+                "arguments": args,
+                "result": result,
+                "duration_ms": round(duration_ms, 2),
+            })
+
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.get("id", ""),
+                "content": json.dumps(result, default=str),
+            })
+
+    return {
+        "content": "",
+        "grader_trace": trace,
+        "parsed": None,
+        "error": "Verification loop exceeded max_turns",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -404,6 +566,30 @@ def parse_json(text: str) -> dict[str, Any]:
     if raw_match:
         return json.loads(raw_match.group())
     raise ValueError("Failed to parse grader JSON output")
+
+
+def try_parse_json(text: str) -> dict[str, Any] | None:
+    """Try to extract and parse a JSON object from text. Returns None on failure."""
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    fence_match = re.search(r"```json\s*\n([\s\S]*?)```", text)
+    if fence_match:
+        try:
+            return json.loads(fence_match.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+
+    raw_match = re.search(r'\{[\s\S]*"rubric_scores"[\s\S]*\}', text)
+    if raw_match:
+        try:
+            return json.loads(raw_match.group(0))
+        except json.JSONDecodeError:
+            pass
+
+    return None
 
 
 def normalize_eval_result(obj: dict[str, Any], rubrics: list[dict[str, Any]]) -> dict[str, Any]:
