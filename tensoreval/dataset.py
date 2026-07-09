@@ -10,6 +10,12 @@ from tensoreval.types import Rubric, Sample
 
 
 class Dataset:
+    """A collection of :class:`Sample` objects to evaluate.
+
+    Load from JSONL (``from_jsonl``) or in-memory dicts (``from_dicts``).
+    Supports indexing, iteration, and ``len()``.
+    """
+
     def __init__(self, samples: list[Sample], name: str = ""):
         if not samples:
             raise ValueError("Dataset must contain at least one sample")

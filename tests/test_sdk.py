@@ -118,17 +118,30 @@ def test_evaluation_calls_openai_shaped_endpoint_and_captures_trace():
     assert result.runs[0].grader_trace["steps"]
 
 
-def test_endpoint_env_rejects_multiple_workers():
+def test_endpoint_env_supports_multiple_workers():
     import tensoreval as te
+    import tensoreval.evaluation as evaluation_mod
 
-    dataset = te.Dataset.from_dicts([{"query": "Hello"}])
+    response = {"choices": [{"message": {"content": "ok"}}]}
+
+    def fake_post_json(url: str, body: dict, headers=None, timeout: float = 60):
+        return response
+
+    dataset = te.Dataset.from_dicts([
+        {"query": "Q1", "reference_answer": "ok"},
+        {"query": "Q2", "reference_answer": "ok"},
+        {"query": "Q3", "reference_answer": "ok"},
+    ])
     env = te.Env.from_endpoint(agent_url="http://localhost:8000/v1/chat/completions")
 
+    previous = evaluation_mod._post_json
+    evaluation_mod._post_json = fake_post_json
     try:
-        te.Evaluation.run(dataset=dataset, env=env, grader=te.AgenticGrader(), workers=2)
-        assert False, "endpoint env should reject multiple workers"
-    except ValueError as exc:
-        assert "workers=1" in str(exc)
+        result = te.Evaluation.run(dataset=dataset, env=env, grader=te.AgenticGrader(), workers=3)
+        assert len(result.runs) == 3
+        assert all(run.error is None for run in result.runs)
+    finally:
+        evaluation_mod._post_json = previous
 
 
 def test_result_report_includes_trace_steps():
@@ -276,16 +289,78 @@ def test_tool_loop_routes_major_providers_to_expected_apis():
     assert "https://api.anthropic.com/v1/messages" in calls
 
 
+def test_result_save_load_roundtrip():
+    import tensoreval as te
+
+    run = te.EvaluationRun(
+        sample_id="case_1",
+        query="Refund order O123",
+        final_response="Refund approved.",
+        reward=0.9,
+        passed=True,
+        latency_ms=42.0,
+        trace={"steps": [{"type": "tool_call", "name": "lookup_order"}]},
+        rubric_scores={"correctness": {"score": 0.9, "reason": "verified"}},
+        reasoning="Policy and order state match.",
+    )
+    result = te.EvaluationResult(runs=[run], metadata={"env": {"agent_url": "http://agent"}})
+
+    with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+        path = f.name
+    try:
+        result.save(path)
+        loaded = te.EvaluationResult.load(path)
+        assert len(loaded.runs) == 1
+        assert loaded.runs[0].sample_id == "case_1"
+        assert loaded.runs[0].query == "Refund order O123"
+        assert loaded.runs[0].final_response == "Refund approved."
+        assert loaded.runs[0].reward == 0.9
+        assert loaded.runs[0].passed is True
+        assert loaded.runs[0].rubric_scores["correctness"]["score"] == 0.9
+    finally:
+        os.unlink(path)
+
+
+def test_sample_ids_are_stable_across_runs():
+    from tensoreval.types import Sample
+
+    s1 = Sample(query="What is 2+2?")
+    s2 = Sample(query="What is 2+2?")
+    assert s1.id == s2.id, "Sample ID should be deterministic"
+    assert s1.id.startswith("case_")
+    assert len(s1.id) == 13  # "case_" + 8 hex chars
+
+    # Different queries should get different IDs
+    s3 = Sample(query="Hello world")
+    assert s1.id != s3.id
+
+
+def test_dashboard_client_disabled_without_api_key():
+    import tensoreval as te
+
+    # Ensure no API key is set
+    old_key = os.environ.pop("TENSOREVAL_API_KEY", None)
+    try:
+        client = te.DashboardClient()
+        assert client.enabled is False
+    finally:
+        if old_key:
+            os.environ["TENSOREVAL_API_KEY"] = old_key
+
+
 def run_all():
     tests = [
         test_dataset_loads_jsonl_with_optional_rubrics_and_reference,
         test_endpoint_env_normalizes_optional_mcp_urls,
         test_evaluation_calls_openai_shaped_endpoint_and_captures_trace,
-        test_endpoint_env_rejects_multiple_workers,
+        test_endpoint_env_supports_multiple_workers,
         test_result_report_includes_trace_steps,
         test_provider_config_defaults_cover_major_providers,
         test_agentic_grader_runs_openai_compatible_tool_loop_with_mcp,
         test_tool_loop_routes_major_providers_to_expected_apis,
+        test_result_save_load_roundtrip,
+        test_sample_ids_are_stable_across_runs,
+        test_dashboard_client_disabled_without_api_key,
     ]
     failed = 0
     for test in tests:

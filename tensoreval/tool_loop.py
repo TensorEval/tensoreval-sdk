@@ -6,13 +6,22 @@ import json
 import os
 import re
 import time
+import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from tensoreval.errors import APIError, AuthenticationError, RateLimitError
+
 
 @dataclass
 class ProviderConfig:
+    """Connection settings for an LLM provider.
+
+    Use ``ProviderConfig.from_name("openai")`` (or ``"anthropic"``,
+    ``"openrouter"``, ``"ollama"``) to get sensible defaults resolved from
+    environment variables.
+    """
     provider: str
     model: str
     api_key: str = ""
@@ -115,6 +124,7 @@ class MCPRegistry:
 
 
 class ToolLoopAgent:
+    """Multi-turn LLM loop that can call MCP tools to verify, then returns structured JSON."""
     def __init__(
         self,
         provider: ProviderConfig,
@@ -151,11 +161,24 @@ class ToolLoopAgent:
                 parsed = _parse_json_object(content)
                 if parsed is None:
                     parsed = {"reward": 0.0, "passed": False, "rubric_scores": {}, "reasoning_summary": content}
-                parsed.setdefault("grader_trace", {"steps": trace_steps})
-                parsed["grader_trace"] = {"steps": trace_steps + parsed.get("grader_trace", {}).get("steps", [])}
+                parsed["grader_trace"] = {"steps": trace_steps}
                 return parsed
 
-            messages.append({"role": "assistant", "content": content, "tool_calls": tool_calls})
+            messages.append({
+                "role": "assistant",
+                "content": content or None,
+                "tool_calls": [
+                    {
+                        "id": call.get("id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": call.get("name", ""),
+                            "arguments": json.dumps(call.get("arguments", {})),
+                        },
+                    }
+                    for call in tool_calls
+                ],
+            })
             for call in tool_calls:
                 name = call.get("name", "")
                 arguments = call.get("arguments", {})
@@ -178,6 +201,7 @@ class ToolLoopAgent:
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call.get("id", ""),
+                    "name": name,
                     "content": json.dumps(result, default=str),
                 })
 
@@ -199,7 +223,10 @@ class ToolLoopAgent:
             "model": self.provider.model,
             "messages": [{"role": "system", "content": self.instructions}] + messages,
             "temperature": self.temperature,
+            "max_tokens": 8000,
         }
+        if not has_tools:
+            body["response_format"] = {"type": "json_object"}
         if has_tools:
             body["tools"] = registry.to_openai_tools()
             body["tool_choice"] = "auto"
@@ -216,7 +243,7 @@ class ToolLoopAgent:
     def _complete_anthropic(self, messages: list[dict[str, Any]], registry: MCPRegistry, has_tools: bool) -> dict[str, Any]:
         body: dict[str, Any] = {
             "model": self.provider.model,
-            "max_tokens": 2000,
+            "max_tokens": 8000,
             "temperature": self.temperature,
             "system": self.instructions,
             "messages": _to_anthropic_messages(messages),
@@ -244,9 +271,9 @@ class ToolLoopAgent:
         return {"content": content, "tool_calls": tool_calls}
 
 
-def _openai_tool_calls(raw: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _openai_tool_calls(raw: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
     calls = []
-    for call in raw:
+    for call in raw or []:
         function = call.get("function", {})
         try:
             arguments = json.loads(function.get("arguments") or "{}")
@@ -316,5 +343,17 @@ def _post_json(
         headers=headers or {"Content-Type": "application/json"},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode())
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        err_body = ""
+        try:
+            err_body = exc.read().decode()
+        except Exception:
+            pass
+        if exc.code == 401:
+            raise AuthenticationError(f"HTTP 401 from {url}: {err_body}") from exc
+        if exc.code == 429:
+            raise RateLimitError(f"HTTP 429 from {url}: {err_body}") from exc
+        raise APIError(f"HTTP {exc.code} from {url}: {err_body}") from exc
