@@ -161,11 +161,24 @@ class ToolLoopAgent:
                 parsed = _parse_json_object(content)
                 if parsed is None:
                     parsed = {"reward": 0.0, "passed": False, "rubric_scores": {}, "reasoning_summary": content}
-                parsed.setdefault("grader_trace", {"steps": trace_steps})
-                parsed["grader_trace"] = {"steps": trace_steps + parsed.get("grader_trace", {}).get("steps", [])}
+                parsed["grader_trace"] = {"steps": trace_steps}
                 return parsed
 
-            messages.append({"role": "assistant", "content": content, "tool_calls": tool_calls})
+            messages.append({
+                "role": "assistant",
+                "content": content or None,
+                "tool_calls": [
+                    {
+                        "id": call.get("id", ""),
+                        "type": "function",
+                        "function": {
+                            "name": call.get("name", ""),
+                            "arguments": json.dumps(call.get("arguments", {})),
+                        },
+                    }
+                    for call in tool_calls
+                ],
+            })
             for call in tool_calls:
                 name = call.get("name", "")
                 arguments = call.get("arguments", {})
@@ -188,6 +201,7 @@ class ToolLoopAgent:
                 messages.append({
                     "role": "tool",
                     "tool_call_id": call.get("id", ""),
+                    "name": name,
                     "content": json.dumps(result, default=str),
                 })
 

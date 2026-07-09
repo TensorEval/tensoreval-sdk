@@ -279,14 +279,17 @@ def _evaluate_sample(
             reasoning=grade["reasoning"],
         )
     except Exception as exc:
+        # Preserve whatever agent response we already captured so the trace
+        # is not lost when grading fails.
         return EvaluationRun(
             sample_id=sample.id,
             query=sample.query,
-            final_response="",
+            final_response=locals().get("final_response", ""),
             reward=0.0,
             passed=False,
             latency_ms=(time.monotonic() - started) * 1000,
             reference_answer=sample.reference_answer,
+            trace=locals().get("trace"),
             error=str(exc),
         )
 
